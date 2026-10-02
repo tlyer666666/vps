@@ -185,4 +185,18 @@ assert_eq "curl success exit code 0" "0" "$?"
 grep -q "api/agent/report" "$TMP/curl.log" && ok "posts to /api/agent/report" || fail "posts to /api/agent/report" "$(cat "$TMP/curl.log" 2>/dev/null)"
 grep -q -- "-H" "$TMP/curl.log" && ok "sends headers" || fail "sends headers" "no -H found"
 
+# ---- 6. degraded environments must not crash (set -u) ----------------------
+mkdir -p "$TMP/empty-proc"
+( export PROC="$TMP/empty-proc" STATE_FILE="$TMP/state-emptyp" DF_CMD="$TMP/fake-df"
+  export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
+  unset SERVER_URL TOKEN
+  bash "$AGENT" --print-payload 2>/dev/null )
+assert_eq "empty /proc still prints payload, exit 0" "0" "$?"
+
+( export PROC="$TMP/empty-proc" STATE_FILE="$TMP/nonexistent-dir/state" DF_CMD="$TMP/fake-df"
+  export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
+  unset SERVER_URL TOKEN
+  bash "$AGENT" --print-payload 2>/dev/null )
+assert_eq "unwritable state dir still prints payload, exit 0" "0" "$?"
+
 finish

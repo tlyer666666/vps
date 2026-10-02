@@ -158,9 +158,12 @@ load_state() {
 save_state() {
   local dir
   dir=$(dirname "$STATE_FILE")
-  mkdir -p "$dir" 2>/dev/null
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    log "cannot create state dir $dir; traffic ledger disabled"
+    return
+  fi
   local tmp="$STATE_FILE.tmp.$$"
-  cat > "$tmp" <<EOF
+  if ! cat > "$tmp" <<EOF
 prev_cpu_total=$CPU_TOTAL
 prev_cpu_idle=$CPU_IDLE
 prev_rx=$NET_RX
@@ -172,6 +175,11 @@ month=$MONTH
 monthly_rx=$monthly_rx
 monthly_tx=$monthly_tx
 EOF
+  then
+    log "cannot write state file $STATE_FILE; traffic ledger disabled"
+    rm -f "$tmp"
+    return
+  fi
   mv -f "$tmp" "$STATE_FILE"
 }
 
@@ -185,6 +193,13 @@ delta_guard() { # prints delta or 0 on counter rollback/first sample
 # ---- sampling and payload --------------------------------------------------
 
 sample() {
+  # defensive defaults: degraded /proc must degrade the payload, never crash
+  HOSTNAME_OUT=""; CORES=1
+  CPU_TOTAL=""; CPU_IDLE=""; CPU_PCT="0.0"
+  MEM_TOTAL=""; MEM_USED=""; SWAP_TOTAL=""; SWAP_USED=""
+  LOAD1=""; LOAD5=""; LOAD15=""; UPTIME=""
+  NET_RX=0; NET_TX=0; TCP_CONNS=0; PROCS=0; DISKS_JSON="[]"
+
   HOSTNAME_OUT=$("$HOSTNAME_CMD" 2>/dev/null | head -n 1)
   case "$HOSTNAME_OUT" in (*[!A-Za-z0-9._-]*) HOSTNAME_OUT="" ;; esac
   CORES=$("$CORES_CMD" 2>/dev/null | head -n 1)
