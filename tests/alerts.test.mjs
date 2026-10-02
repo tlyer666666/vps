@@ -154,3 +154,32 @@ test('state() exposes internal per-server memory', () => {
   engine.ingest(server, metric(1000), 1000);
   assert.equal(engine.state(server.id).lastSeen, 1000);
 });
+
+test('a fresh engine (hub restart) does not re-notify an already-open event', () => {
+  const store = openStore(':memory:');
+  const notified = [];
+  const opts = {
+    thresholds: { cpu: 90, mem: 90, disk: 90, consecutive: 1, expiryDays: 7 },
+    notifyCooldownMin: 10,
+  };
+  const first = new AlertEngine(store, { ...opts, onNotify: (e) => notified.push(e.type) });
+  const { id } = store.createServer({ name: 'a', intervalSec: 10 });
+  const server = store.getServer(id);
+  first.ingest(server, metric(1000, { cpuPct: 99 }), 1000);
+  assert.equal(notified.filter((t) => t === 'cpu').length, 1);
+
+  const second = new AlertEngine(store, { ...opts, onNotify: (e) => notified.push(e.type) });
+  second.ingest(server, metric(2000, { cpuPct: 99 }), 2000);
+  second.tick(3000);
+  assert.equal(notified.filter((t) => t === 'cpu').length, 1, 'open event reused: no duplicate webhook');
+  store.close();
+});
+
+test('forget drops per-server memory when a server is deleted (iteration 2)', () => {
+  const { store, engine, server } = setup();
+  engine.ingest(server, metric(1000), 1000);
+  assert.ok(engine.state(server.id));
+  engine.forget(server.id);
+  assert.equal(engine.state(server.id), null);
+  store.close();
+});

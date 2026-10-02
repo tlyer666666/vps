@@ -23,13 +23,13 @@ export function createNotifier({ webhookUrl, fetchImpl = fetch, timeoutMs = 5000
         signal: controller.signal,
       });
       if (!res.ok) {
-        console.warn(`[notify] webhook ${webhookUrl} responded ${res.status}`);
+        console.warn(`[notify] webhook ${url} responded ${res.status}`);
         return false;
       }
       return true;
     } catch (err) {
       const reason = err?.name === 'AbortError' ? 'timeout' : err?.message;
-      console.warn(`[notify] webhook ${webhookUrl} failed: ${reason}`);
+      console.warn(`[notify] webhook ${url} failed: ${reason}`);
       return false;
     } finally {
       clearTimeout(timer);

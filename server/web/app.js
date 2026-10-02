@@ -121,8 +121,15 @@ if (typeof document !== 'undefined') {
     $('#online-count').textContent = `${online}/${state.servers.length} 在线`;
   }
 
-  function renderOverview() {
+  // SSE frames call this — only the card grid and the online count change,
+  // so the sort dropdown keeps focus and listeners are not re-attached.
+  function updateOverviewCards() {
     renderTopbar();
+    const cards = document.getElementById('cards');
+    if (cards) cards.innerHTML = renderCards(sortedServers());
+  }
+
+  function renderOverview() {
     $('#main').innerHTML = `
       <div class="toolbar">
         <label>排序
@@ -140,11 +147,12 @@ if (typeof document !== 'undefined') {
         <button id="btn-admin">管理</button>
         <button id="btn-add" class="primary">添加服务器</button>
       </div>
-      <div id="cards" class="grid">${renderCards(sortedServers())}</div>`;
-    $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; $('#cards').innerHTML = renderCards(sortedServers()); });
+      <div id="cards" class="grid"></div>`;
+    $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; updateOverviewCards(); });
     $('#btn-add').addEventListener('click', () => showServerForm(null));
     $('#btn-admin').addEventListener('click', () => { location.hash = '#/admin'; });
     $('#btn-alerts').addEventListener('click', showEvents);
+    updateOverviewCards();
   }
 
   function modal(html) {
@@ -460,8 +468,10 @@ if (typeof document !== 'undefined') {
     if (state.es) return;
     const es = new EventSource('/api/stream');
     es.addEventListener('overview', (e) => {
+      // SSE is alive again — the degraded polling loop must stop.
+      if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
       state.servers = JSON.parse(e.data);
-      if (location.hash === '' || location.hash === '#/') renderOverview();
+      if (location.hash === '' || location.hash === '#/') updateOverviewCards();
       if (state.detail.id && location.hash.startsWith('#/server/')) renderTopbar();
     });
     es.onerror = () => {
@@ -476,7 +486,11 @@ if (typeof document !== 'undefined') {
     try {
       const res = await api('/api/overview');
       state.servers = await res.json();
-      if (location.hash === '' || location.hash === '#/') renderOverview();
+      if (location.hash === '' || location.hash === '#/') {
+        // first paint builds the shell; repeat visits (poll fallback) only refresh cards
+        if (document.getElementById('cards')) updateOverviewCards();
+        else renderOverview();
+      }
     } catch { /* redirected to login */ }
   }
 

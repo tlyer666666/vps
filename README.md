@@ -39,7 +39,7 @@ node server/main.js                # 默认 0.0.0.0:3577,数据在 ./data/
 curl -fsSL http://HUB:3577/install-agent.sh | bash -s -- --server http://HUB:3577 --token <TOKEN>
 ```
 
-(有 systemd 自动注册 `vpswatch-agent.service` 并开机自启;没有则 nohup 后备。卸载:`scripts/uninstall-agent.sh`。)
+(有 systemd 自动注册 `vpswatch-agent.service` 并开机自启,服务默认带 systemd 沙箱加固;没有则 nohup 后备;支持 `--user <用户>` 以非 root 运行。卸载:`scripts/uninstall-agent.sh`。注意:探针上报以 Bearer token 鉴权,公网直连时 token 明文传输——生产环境务必走 TLS 反代。)
 
 ### 3. 生产环境建议
 
@@ -60,7 +60,8 @@ watch.example.com {
 | `--port` / `VPSWATCH_PORT` | 3577 | 监听端口 |
 | `--host` / `VPSWATCH_HOST` | 0.0.0.0 | 监听地址 |
 | `--data-dir` / `--db-path` | ./data | SQLite 数据目录/文件 |
-| `--retention-days` | 30 | 原始指标保留天数(每日清理) |
+| `--retention-days` | 30 | 原始指标保留天数(每 6 小时清理一次) |
+| `--session-ttl-days` / `VPSWATCH_SESSION_TTL_DAYS` | 7 | 管理会话有效期 |
 | `--interval` | 10 | 默认上报间隔(秒,可在面板按服务器覆盖) |
 | `--admin-password` | 随机生成 | 首次启动的管理员密码 |
 | `--trust-proxy` / `VPSWATCH_TRUST_PROXY` | false | 置于 Nginx/Caddy 反代后时设为 true:限速按 X-Forwarded-For 最后一跳取客户端 IP,并自动为会话 Cookie 加 Secure |
@@ -69,6 +70,10 @@ watch.example.com {
 ## 流量账本口径
 
 每日/每月流量由**探针**基于网卡累计计数器差分记账,状态存 `/var/lib/vpswatch/state`:跨日自动清零;计数器回退(重启)该周期记 0,不产生天文数字;**重启期间**的流量不计。注意:探针处于运行状态但停止采集(如服务停止一段时间后再恢复)时,停采期间的流量会整体计入恢复后的第一个样本——如需严格对账请以此口径理解。服务端重启不影响账本。
+
+## 备份与升级
+
+数据库启用 WAL 模式(`vpswatch.db` + `vpswatch.db-wal` + `vpswatch.db-shm` 三个文件)。备份请**先停止服务**,或至少三个文件一起拷贝;运行中只拷主文件可能得到损坏副本。升级时重跑 `scripts/install-server.sh` 会整体替换程序目录,数据目录不动。
 
 ## 开发与测试
 

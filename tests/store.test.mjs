@@ -114,11 +114,15 @@ test('openEvent is idempotent while open; reopen after resolve creates new event
   const { id } = s.createServer({ name: 'a' });
   const e1 = s.openEvent({ serverId: id, type: 'cpu', level: 'critical', message: 'hi', }, 1000);
   const e1again = s.openEvent({ serverId: id, type: 'cpu', level: 'critical', message: 'hi' }, 2000);
-  assert.equal(e1, e1again);
+  assert.equal(e1.id, e1again.id, 'same open event must be reused');
+  assert.equal(e1.existed, false);
+  assert.equal(e1again.existed, true, 'reuse must flag existed for restart-safe notify suppression');
+  assert.equal(e1again.startedAt, 1000, 'reuse reports the original start time');
   const resolved = s.resolveEvent(id, 'cpu', 3000);
   assert.equal(resolved, 1);
   const e2 = s.openEvent({ serverId: id, type: 'cpu', level: 'critical', message: 'hi' }, 4000);
-  assert.notEqual(e2, e1);
+  assert.notEqual(e2.id, e1.id);
+  assert.equal(e2.existed, false);
   const rows = s.listEvents({ serverId: id });
   assert.equal(rows.length, 2);
   assert.equal(rows[0].startedAt >= rows[1].startedAt, true); // newest first
@@ -136,6 +140,49 @@ test('latestPerServer returns most recent metric per server', () => {
   assert.equal(map.get(a.id).cpuPct, 7);
   assert.equal(map.get(b.id).cpuPct, 9);
   assert.equal(map.size, 2);
+  s.close();
+});
+
+test('latestCached mirrors the persisted latest row and invalidates correctly', () => {
+  const s = freshStore();
+  const a = s.createServer({ name: 'a' });
+  const b = s.createServer({ name: 'b' });
+  assert.equal(s.latestCached().size, 0, 'empty at boot');
+
+  s.insertMetric(a.id, { ts: 1000, cpuPct: 5 });
+  s.insertMetric(a.id, { ts: 2000, cpuPct: 7 });
+  s.insertMetric(b.id, { ts: 1500, cpuPct: 9 });
+  assert.equal(s.latestCached().get(a.id).cpuPct, 7, 'cache holds the newest row');
+  assert.equal(s.latestCached().get(b.id).cpuPct, 9);
+  assert.equal(s.latestCached().size, 2);
+
+  s.deleteServer(a.id);
+  assert.equal(s.latestCached().has(a.id), false, 'deleteServer drops the cache entry');
+
+  s.insertMetric(b.id, { ts: 3000, cpuPct: 11 });
+  const removed = s.pruneOlderThan(2500); // removes b's rows 1500+3000? no: 3000 survives
+  assert.equal(s.latestCached().get(b.id).cpuPct, 11);
+
+  s.pruneOlderThan(Date.now() + 1_000_000); // wipes everything
+  assert.equal(s.latestCached().has(b.id), false, 'prune re-seeds the cache');
+  s.close();
+});
+
+test('getHistory SQL-bucket means match hand-computed values', () => {
+  const s = freshStore();
+  const { id } = s.createServer({ name: 'a' });
+  // 8 points, cpuPct = i, bucketed to 4 → means 0.5 / 2.5 / 4.5 / 6.5
+  for (let i = 0; i < 8; i++) {
+    s.insertMetric(id, { ts: i * 1000, cpuPct: i, memUsed: 100 + i, memTotal: 200 });
+  }
+  const { points, downsampled } = s.getHistory(id, 0, 8000, 4);
+  assert.equal(downsampled, true);
+  assert.equal(points.length, 4);
+  assert.deepEqual(points.map((p) => p.cpuPct), [0.5, 2.5, 4.5, 6.5]);
+  assert.deepEqual(points.map((p) => p.ts), [0, 2000, 4000, 6000]);
+  assert.ok(points.every((p) => p.serverId === id));
+  // NULL fields stay absent (SQL avg ignores NULLs, same as the old JS path)
+  assert.ok(points.every((p) => p.rxBytes === undefined), 'null columns must not appear');
   s.close();
 });
 

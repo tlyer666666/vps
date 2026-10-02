@@ -25,6 +25,14 @@ echo "$unit" | grep -q 'Restart=always' && ok "agent unit restarts always" || fa
 unit2=$(bash scripts/install-server.sh --print-unit 2>/dev/null)
 echo "$unit2" | grep -q 'ExecStart=.*main.js' && ok "server unit runs main.js" || fail "server unit ExecStart" "$unit2"
 echo "$unit2" | grep -q 'Restart=always' && ok "server unit restarts always" || fail "server unit Restart" "$unit2"
+echo "$unit" | grep -q 'NoNewPrivileges=true' && ok "agent unit sandboxed (NoNewPrivileges)" || fail "agent sandbox" "missing"
+echo "$unit" | grep -q 'ProtectSystem=strict' && ok "agent unit ProtectSystem" || fail "agent ProtectSystem" "missing"
+echo "$unit2" | grep -q 'NoNewPrivileges=true' && ok "server unit sandboxed" || fail "server sandbox" "missing"
+echo "$unit2" | grep -vq 'MemoryDenyWriteExecute' && ok "hub unit avoids MemoryDenyWriteExecute (V8 JIT)" || fail "hub unit" "MDWE would crash node"
+
+# ---- 3a. installer validates --user (iteration 3 finding 4) -----------------
+bash scripts/install-agent.sh --server http://x --token t --user no-such-user-xyz >/dev/null 2>&1
+[ $? -ne 0 ] && ok "unknown --user rejected" || fail "--user validation" "accepted unknown user"
 
 # ---- 3. missing required args ---------------------------------------------
 err=$(bash scripts/install-agent.sh --server http://x 2>&1 >/dev/null)
@@ -40,6 +48,17 @@ PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12345 --password dummy
 [ -f "$TMP/root2/opt/vpswatch/server/main.js" ] && ok "server tree installed" || fail "server tree" "missing"
 [ -f "$TMP/root2/opt/vpswatch/scripts/install-agent.sh" ] && ok "scripts tree installed" || fail "scripts tree" "missing"
 [ -f "$TMP/root2/opt/vpswatch/agent/vpswatch-agent.sh" ] && ok "agent tree installed" || fail "agent tree" "missing"
+
+# ---- 3c. reinstall (upgrade) must not nest trees (iteration 1 finding 3)
+PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12346 --password dummy123 --no-start >/dev/null 2>&1
+[ -f "$TMP/root2/opt/vpswatch/server/main.js" ] && ok "reinstall keeps main.js top-level" || fail "reinstall" "nested server/server"
+[ ! -d "$TMP/root2/opt/vpswatch/server/server" ] && ok "reinstall does not nest server dir" || fail "reinstall nest" "server/server exists"
+
+# ---- 3d. installer rejects non-numeric interval (iteration 1 finding 4)
+bash scripts/install-agent.sh --server http://x --token t --interval 10s >/dev/null 2>&1
+[ $? -ne 0 ] && ok "non-numeric --interval rejected" || fail "interval validation" "accepted 10s"
+bash scripts/install-agent.sh --server http://x --token t --interval 0 >/dev/null 2>&1
+[ $? -ne 0 ] && ok "zero --interval rejected" || fail "interval validation" "accepted 0"
 
 # ---- 4. agent install with temp PREFIX (no systemd, no start) --------------
 PREFIX="$TMP/root" bash scripts/install-agent.sh \

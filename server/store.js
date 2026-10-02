@@ -33,8 +33,39 @@ const SERVER_PATCH = [
 
 export function openStore(dbPath) {
   const db = new DatabaseSync(dbPath);
+  // WAL + NORMAL: frequent small inserts without a per-commit fsync stalling
+  // the event loop. Power loss may drop the last commits but cannot corrupt
+  // the DB — acceptable for metrics. :memory: test DBs ignore journal_mode.
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA busy_timeout = 5000');
+
+  // node:sqlite re-prepares on every prepare() call (no LRU cache on Node 22),
+  // so static SQL strings get a hand-rolled statement cache. Dynamic SQL
+  // (updateServer) must stay uncached — its string varies per patch shape.
+  const statements = new Map();
+  const prep = (sql) => {
+    let stmt = statements.get(sql);
+    if (!stmt) {
+      stmt = db.prepare(sql);
+      statements.set(sql, stmt);
+    }
+    return stmt;
+  };
+
+  // O(1) latest-metric lookups for ingest (prev counter) and buildOverview.
+  // Seeded once at open (restart rebuild), updated on write paths.
+  const latestCache = new Map();
+  const seedLatestCache = () => {
+    latestCache.clear();
+    for (const [serverId, row] of store.latestPerServer()) {
+      latestCache.set(serverId, row);
+    }
+  };
+
   const store = {
     db,
+    prep,
 
     initSchema() {
       db.exec(`
@@ -97,7 +128,7 @@ export function openStore(dbPath) {
       expiresAt = null, notes = '', intervalSec = 10, sortOrder = 0 } = {}) {
       const token = newToken();
       const now = Date.now();
-      const res = db.prepare(`
+      const res = prep(`
         INSERT INTO servers (name, tag, provider, region, price_cny, expires_at, notes,
                              token_hash, interval_sec, sort_order, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -107,11 +138,11 @@ export function openStore(dbPath) {
     },
 
     listServers() {
-      return db.prepare(`SELECT ${SERVER_COLS} FROM servers ORDER BY sort_order, id`).all();
+      return prep(`SELECT ${SERVER_COLS} FROM servers ORDER BY sort_order, id`).all();
     },
 
     getServer(id) {
-      return db.prepare(`SELECT ${SERVER_COLS} FROM servers WHERE id = ?`).get(id) ?? null;
+      return prep(`SELECT ${SERVER_COLS} FROM servers WHERE id = ?`).get(id) ?? null;
     },
 
     updateServer(id, patch = {}) {
@@ -129,20 +160,21 @@ export function openStore(dbPath) {
     },
 
     deleteServer(id) {
-      db.prepare('DELETE FROM metrics WHERE server_id = ?').run(id);
-      db.prepare('DELETE FROM events WHERE server_id = ?').run(id);
-      db.prepare('DELETE FROM servers WHERE id = ?').run(id);
+      prep('DELETE FROM metrics WHERE server_id = ?').run(id);
+      prep('DELETE FROM events WHERE server_id = ?').run(id);
+      prep('DELETE FROM servers WHERE id = ?').run(id);
+      latestCache.delete(id);
     },
 
     resetToken(id) {
       const token = newToken();
-      db.prepare('UPDATE servers SET token_hash = ? WHERE id = ?').run(sha256hex(token), id);
+      prep('UPDATE servers SET token_hash = ? WHERE id = ?').run(sha256hex(token), id);
       return token;
     },
 
     findServerByToken(token) {
       const hash = sha256hex(token);
-      for (const row of db.prepare('SELECT id, token_hash FROM servers').all()) {
+      for (const row of prep('SELECT id, token_hash FROM servers').all()) {
         if (safeEqualStr(row.token_hash, hash)) {
           return store.getServer(row.id);
         }
@@ -155,39 +187,47 @@ export function openStore(dbPath) {
     insertMetric(serverId, m = {}) {
       const cols = ['server_id', 'ts', ...METRIC_FIELDS.map(([, c]) => c)];
       const vals = [serverId, m.ts, ...METRIC_FIELDS.map(([k]) => m[k] ?? null)];
-      db.prepare(`INSERT INTO metrics (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
+      prep(`INSERT INTO metrics (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
         .run(...vals);
+      // Cache only after the insert actually committed — a failed write must
+      // leave prev = last *persisted* row so speeds don't jump.
+      latestCache.set(serverId, { serverId, ...m });
+    },
+
+    latestCached() {
+      return latestCache;
     },
 
     getHistory(serverId, fromMs, toMs, maxPoints = 400) {
-      const rows = db.prepare(`
-        SELECT ${METRIC_COLS} FROM metrics
-        WHERE server_id = ? AND ts >= ? AND ts <= ? ORDER BY ts
-      `).all(serverId, fromMs, toMs);
-      if (rows.length <= maxPoints) {
+      const total = prep(`
+        SELECT COUNT(*) AS c FROM metrics
+        WHERE server_id = ? AND ts >= ? AND ts <= ?
+      `).get(serverId, fromMs, toMs).c;
+      if (total <= maxPoints) {
+        const rows = prep(`
+          SELECT ${METRIC_COLS} FROM metrics
+          WHERE server_id = ? AND ts >= ? AND ts <= ? ORDER BY ts
+        `).all(serverId, fromMs, toMs);
         return { points: rows, downsampled: false };
       }
+      // Bucket in SQL: avg() ignores NULLs per column, matching the old JS
+      // per-key sums/counts. ~400 rows leave the DB instead of the full range.
+      // node:sqlite does not reliably honor AS aliases on aggregate columns,
+      // so address values positionally (a0..aN) and map back to camelCase.
       const bucketMs = (toMs - fromMs) / maxPoints;
-      const buckets = new Map();
-      for (const row of rows) {
-        const idx = Math.min(Math.floor((row.ts - fromMs) / bucketMs), maxPoints - 1);
-        let b = buckets.get(idx);
-        if (!b) {
-          b = { ts: fromMs + idx * bucketMs, sums: {}, counts: {} };
-          buckets.set(idx, b);
-        }
-        for (const key of Object.keys(row)) {
-          if (key === 'serverId' || row[key] === null) continue;
-          b.sums[key] = (b.sums[key] ?? 0) + row[key];
-          b.counts[key] = (b.counts[key] ?? 0) + 1;
-        }
-      }
-      const points = [...buckets.keys()].sort((a, b) => a - b).map((idx) => {
-        const b = buckets.get(idx);
-        const point = { serverId, ts: b.ts };
-        for (const key of Object.keys(b.sums)) {
-          point[key] = b.sums[key] / b.counts[key];
-        }
+      const avgCols = METRIC_FIELDS.map(([, col], i) => `avg(${col}) AS a${i}`).join(', ');
+      const rows = prep(`
+        SELECT CAST((ts - ?) / ? AS INT) AS b, ${avgCols}
+        FROM metrics
+        WHERE server_id = ? AND ts >= ? AND ts <= ?
+        GROUP BY b ORDER BY b
+      `).all(fromMs, bucketMs, serverId, fromMs, toMs);
+      const points = rows.map((row) => {
+        const point = { serverId, ts: fromMs + row.b * bucketMs };
+        METRIC_FIELDS.forEach(([key], i) => {
+          const v = row[`a${i}`];
+          if (v !== null && v !== undefined) point[key] = v;
+        });
         return point;
       });
       return { points, downsampled: true };
@@ -195,7 +235,7 @@ export function openStore(dbPath) {
 
     latestPerServer() {
       const mCols = METRIC_COLS.split(',').map((c) => `m.${c.trim()}`).join(', ');
-      const rows = db.prepare(`
+      const rows = prep(`
         SELECT ${mCols} FROM metrics m
         JOIN (SELECT server_id, MAX(ts) AS mts FROM metrics GROUP BY server_id) latest
           ON m.server_id = latest.server_id AND m.ts = latest.mts
@@ -206,25 +246,42 @@ export function openStore(dbPath) {
     },
 
     pruneOlderThan(cutoffMs) {
-      return db.prepare('DELETE FROM metrics WHERE ts < ?').run(cutoffMs).changes;
+      const removed = prep('DELETE FROM metrics WHERE ts < ?').run(cutoffMs).changes;
+      if (removed > 0) seedLatestCache(); // prune can remove a server's only rows
+      return removed;
+    },
+
+    deleteExpiredSessions(nowMs = Date.now()) {
+      return prep('DELETE FROM sessions WHERE expires_at <= ?').run(nowMs).changes;
+    },
+
+    deleteAllSessions() {
+      return prep('DELETE FROM sessions').run().changes;
+    },
+
+    pruneResolvedEvents(cutoffMs) {
+      return prep('DELETE FROM events WHERE resolved_at IS NOT NULL AND resolved_at < ?')
+        .run(cutoffMs).changes;
     },
 
     // ---- events ----
 
     openEvent({ serverId, type, level, message }, nowMs = Date.now()) {
-      const existing = db.prepare(
-        'SELECT id FROM events WHERE server_id = ? AND type = ? AND resolved_at IS NULL'
+      const existing = prep(
+        'SELECT id, started_at FROM events WHERE server_id = ? AND type = ? AND resolved_at IS NULL'
       ).get(serverId, type);
-      if (existing) return existing.id;
-      const res = db.prepare(`
+      if (existing) {
+        return { id: existing.id, startedAt: existing.started_at, existed: true };
+      }
+      const res = prep(`
         INSERT INTO events (server_id, type, level, message, started_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(serverId, type, level, message, nowMs);
-      return Number(res.lastInsertRowid);
+      return { id: Number(res.lastInsertRowid), startedAt: nowMs, existed: false };
     },
 
     resolveEvent(serverId, type, nowMs = Date.now()) {
-      return db.prepare(`
+      return prep(`
         UPDATE events SET resolved_at = ?
         WHERE server_id = ? AND type = ? AND resolved_at IS NULL
       `).run(nowMs, serverId, type).changes;
@@ -234,22 +291,22 @@ export function openStore(dbPath) {
       const base = `SELECT id, server_id AS serverId, type, level, message,
         started_at AS startedAt, resolved_at AS resolvedAt FROM events`;
       if (serverId != null) {
-        return db.prepare(`${base} WHERE server_id = ? ORDER BY started_at DESC, id DESC LIMIT ?`)
+        return prep(`${base} WHERE server_id = ? ORDER BY started_at DESC, id DESC LIMIT ?`)
           .all(serverId, limit);
       }
-      return db.prepare(`${base} ORDER BY started_at DESC, id DESC LIMIT ?`).all(limit);
+      return prep(`${base} ORDER BY started_at DESC, id DESC LIMIT ?`).all(limit);
     },
 
     // ---- settings ----
 
     getSetting(key, def = null) {
-      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+      const row = prep('SELECT value FROM settings WHERE key = ?').get(key);
       if (!row) return def;
       try { return JSON.parse(row.value); } catch { return row.value; }
     },
 
     setSetting(key, val) {
-      db.prepare(`
+      prep(`
         INSERT INTO settings (key, value) VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run(key, JSON.stringify(val));
@@ -267,23 +324,24 @@ export function openStore(dbPath) {
 
     createSession(ttlMs, nowMs = Date.now()) {
       const token = newToken();
-      db.prepare('INSERT INTO sessions (token_hash, expires_at, created_at) VALUES (?, ?, ?)')
+      prep('INSERT INTO sessions (token_hash, expires_at, created_at) VALUES (?, ?, ?)')
         .run(sha256hex(token), nowMs + ttlMs, nowMs);
       return token;
     },
 
     getSession(token, nowMs = Date.now()) {
-      const row = db.prepare('SELECT expires_at AS expiresAt FROM sessions WHERE token_hash = ?')
+      const row = prep('SELECT expires_at AS expiresAt FROM sessions WHERE token_hash = ?')
         .get(sha256hex(token));
       if (!row || row.expiresAt <= nowMs) return null;
       return row;
     },
 
     deleteSession(token) {
-      db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256hex(token));
+      prep('DELETE FROM sessions WHERE token_hash = ?').run(sha256hex(token));
     },
   };
 
   store.initSchema();
+  seedLatestCache();
   return store;
 }

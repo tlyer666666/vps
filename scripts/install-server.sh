@@ -49,6 +49,22 @@ EnvironmentFile=$CONF
 Restart=always
 RestartSec=5
 User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=-$APP_DIR/data -$APP_DIR/../var/lib/vpswatch
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -72,12 +88,16 @@ fi
 
 echo "installing vpswatch hub..."
 mkdir -p "$APP_DIR" "$(dirname "$CONF")" "${PREFIX}/var/lib/vpswatch"
+# Reinstall (upgrade) must replace the trees, not nest them inside old ones.
+rm -rf "$APP_DIR/server" "$APP_DIR/scripts" "$APP_DIR/agent"
 cp -R "$SRC_DIR" "$APP_DIR/server"
 # The hub serves /install-agent.sh and /agent.sh from these trees — without
 # them the panel's copy-paste agent one-liner 404s in the installed layout.
 cp -R "$SCRIPT_DIR/../scripts" "$SCRIPT_DIR/../agent" "$APP_DIR/"
 
 GENERATED=""
+HAD_CONF=0
+[ -f "$CONF" ] && HAD_CONF=1
 if [ -z "$PASSWORD" ]; then
   PASSWORD=$(LC_ALL=C tr -dc 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789' </dev/urandom | head -c 16)
   GENERATED="$PASSWORD"
@@ -104,5 +124,8 @@ fi
 
 if [ -n "$GENERATED" ]; then
   echo "管理员密码(仅显示一次,请立即保存): $GENERATED"
+  if [ "$HAD_CONF" -eq 1 ]; then
+    echo "注意:检测到已有配置 —— 若数据库已初始化,此密码不生效,请继续使用原密码或在面板修改。"
+  fi
 fi
 echo "done."

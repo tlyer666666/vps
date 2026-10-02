@@ -121,7 +121,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
   let pruneTimer = null;
 
   function buildOverview(now = Date.now()) {
-    const latest = store.latestPerServer();
+    const latest = store.latestCached();
     return store.listServers().map((s) => {
       const m = latest.get(s.id) ?? null;
       const intervalSec = s.intervalSec ?? config.intervalSec ?? 10;
@@ -195,7 +195,23 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     return store.getSession(token) !== null;
   }
 
+  // CSRF defense-in-depth: SameSite=Lax covers modern browsers, but the
+  // Chrome "Lax+POST" 2-minute exception plus an enctype=text/plain form can
+  // smuggle JSON. When the browser advertises an Origin/Referer that does not
+  // match Host, refuse the mutation. curl/agents send neither → unaffected.
+  function crossOriginMutation(req) {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return false;
+    const src = req.headers.origin ?? req.headers.referer;
+    if (!src) return false;
+    try {
+      return new URL(src).host !== req.headers.host;
+    } catch {
+      return true;
+    }
+  }
+
   async function handleLogin(req, res, ip) {
+    if (crossOriginMutation(req)) return json(res, 403, { error: 'cross-origin request blocked' });
     if (loginBlocked(ip)) return json(res, 429, { error: 'too many attempts' });
     const { raw } = await readBody(req);
     let body = {};
@@ -229,7 +245,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     if (!v.ok) return json(res, 400, { error: v.error });
 
     const now = Date.now();
-    const prev = store.latestPerServer().get(server.id) ?? null;
+    const prev = store.latestCached().get(server.id) ?? null;
     const dtSec = prev ? Math.max(0, (now - prev.ts) / 1000) : 0;
     const metric = normalize(v.value, { prevCounter: prev, nowMs: now, dtSec });
 
@@ -287,6 +303,71 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     }
   }
 
+  // ---- input validation (rejected payloads must never reach the store) ----
+
+  function isIntIn(v, lo, hi) {
+    return Number.isInteger(v) && v >= lo && v <= hi;
+  }
+
+  // Returns null when valid, otherwise an error message.
+  function settingsPatchError(patch) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return 'body must be an object';
+    if (patch.thresholds !== undefined) {
+      const t = patch.thresholds;
+      if (t === null || typeof t !== 'object' || Array.isArray(t)) return 'thresholds must be an object';
+      for (const k of ['cpu', 'mem', 'disk']) {
+        if (t[k] !== undefined && !(typeof t[k] === 'number' && Number.isFinite(t[k]) && t[k] >= 1 && t[k] <= 100)) {
+          return `thresholds.${k} must be a number in [1, 100]`;
+        }
+      }
+      if (t.consecutive !== undefined && !isIntIn(t.consecutive, 1, 60)) return 'thresholds.consecutive must be an integer in [1, 60]';
+      if (t.expiryDays !== undefined && !isIntIn(t.expiryDays, 0, 3650)) return 'thresholds.expiryDays must be an integer in [0, 3650]';
+    }
+    if (patch.notifyCooldownMin !== undefined && !isIntIn(patch.notifyCooldownMin, 1, 1440)) {
+      return 'notifyCooldownMin must be an integer in [1, 1440]';
+    }
+    if (patch.retentionDays !== undefined && !isIntIn(patch.retentionDays, 1, 3650)) {
+      return 'retentionDays must be an integer in [1, 3650]';
+    }
+    if (patch.webhookUrl !== undefined) {
+      const u = patch.webhookUrl;
+      if (u !== '' && (typeof u !== 'string' || u.length > 500 || !/^https?:\/\/.+/i.test(u))) {
+        return 'webhookUrl must be empty or an http(s) URL';
+      }
+    }
+    return null;
+  }
+
+  // Server create/update fields. Partial=true validates only present keys.
+  function serverInputError(body, { partial = false } = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return 'body must be an object';
+    if (!partial || body.name !== undefined) {
+      if (typeof body.name !== 'string' || body.name.trim().length < 1 || body.name.trim().length > 100) {
+        return 'name must be a string of 1..100 characters';
+      }
+    }
+    for (const k of ['tag', 'provider', 'region', 'notes']) {
+      if (body[k] !== undefined && (typeof body[k] !== 'string' || body[k].length > 200)) {
+        return `${k} must be a string of at most 200 characters`;
+      }
+    }
+    if (body.priceCny !== undefined && body.priceCny !== null
+      && !(typeof body.priceCny === 'number' && Number.isFinite(body.priceCny) && body.priceCny >= 0 && body.priceCny <= 1e7)) {
+      return 'priceCny must be null or a number in [0, 1e7]';
+    }
+    if (body.expiresAt !== undefined && body.expiresAt !== null
+      && !(Number.isInteger(body.expiresAt) && body.expiresAt >= 0 && body.expiresAt <= 4102444800000)) {
+      return 'expiresAt must be null or an epoch-ms integer';
+    }
+    if (body.intervalSec !== undefined && !isIntIn(body.intervalSec, 5, 86400)) {
+      return 'intervalSec must be an integer in [5, 86400]';
+    }
+    if (body.sortOrder !== undefined && !(Number.isInteger(body.sortOrder) && body.sortOrder >= 0)) {
+      return 'sortOrder must be a non-negative integer';
+    }
+    return null;
+  }
+
   const server = createServer(async (req, res) => {
     const ip = clientIp(req);
     const url = new URL(req.url, 'http://localhost');
@@ -316,6 +397,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         return json(res, 405, { error: 'method not allowed' });
       }
       if (!isAuthed(req)) return json(res, 401, { error: 'unauthorized' });
+      if (crossOriginMutation(req)) return json(res, 403, { error: 'cross-origin request blocked' });
 
       if (req.method === 'GET' && path === '/api/overview') {
         return json(res, 200, buildOverview());
@@ -324,7 +406,8 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         return handleStream(req, res);
       }
       if (req.method === 'GET' && path === '/api/events') {
-        const limit = Math.min(Number(url.searchParams.get('limit')) || 100, 1000);
+        const raw = Number(url.searchParams.get('limit'));
+        const limit = Math.min(Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 100, 1000);
         const serverId = url.searchParams.get('server_id');
         return json(res, 200, store.listEvents({
           limit,
@@ -353,17 +436,22 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         const { raw } = await readBody(req);
         let body = {};
         try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
-        if (typeof body.name !== 'string' || body.name.trim() === '') {
-          return json(res, 400, { error: 'name is required' });
-        }
+        const err = serverInputError(body);
+        if (err) return json(res, 400, { error: err });
         const created = store.createServer(body);
         broadcast();
         return json(res, 200, created);
+      }
+      if (path === '/api/admin/servers' && req.method === 'GET') {
+        return json(res, 200, store.listServers());
       }
       const idMatch = path.match(/^\/api\/admin\/servers\/(\d+)(\/reset-token)?$/);
       if (idMatch) {
         const id = Number(idMatch[1]);
         if (!store.getServer(id)) return json(res, 404, { error: 'no such server' });
+        if (req.method === 'GET' && !idMatch[2]) {
+          return json(res, 200, store.getServer(id));
+        }
         if (req.method === 'POST' && idMatch[2]) {
           return json(res, 200, { id, token: store.resetToken(id) });
         }
@@ -371,12 +459,15 @@ export function createApp({ config, store, engine = null, notifier = null, log =
           const { raw } = await readBody(req);
           let body = {};
           try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+          const err = serverInputError(body, { partial: true });
+          if (err) return json(res, 400, { error: err });
           store.updateServer(id, body);
           broadcast();
           return json(res, 200, { ok: true });
         }
         if (req.method === 'DELETE' && !idMatch[2]) {
           store.deleteServer(id);
+          engine?.forget?.(id);
           broadcast();
           return json(res, 200, { ok: true });
         }
@@ -387,6 +478,8 @@ export function createApp({ config, store, engine = null, notifier = null, log =
           const { raw } = await readBody(req);
           let body = {};
           try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+          const err = settingsPatchError(body);
+          if (err) return json(res, 400, { error: err });
           applySettings(body);
           return json(res, 200, settingsView());
         }
@@ -398,6 +491,10 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         const pw = typeof body.password === 'string' ? body.password : '';
         if (pw.length < 8) return json(res, 400, { error: 'password must be at least 8 characters' });
         store.setAdminPasswordHash(await hashPassword(pw));
+        // Rotating the password must evict every existing session cookie —
+        // otherwise a stolen cookie survives the rotation for its full TTL.
+        store.deleteAllSessions();
+        res.setHeader('set-cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
         return json(res, 200, { ok: true });
       }
       return json(res, 404, { error: 'not found' });
@@ -419,13 +516,27 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         } catch (err) {
           log.error(`[tick] ${err.stack ?? err}`);
         }
+        // bounded-memory sweep: stale rate buckets and empty fail lists
+        const now = Date.now();
+        for (const [ip, bucket] of agentBuckets) {
+          if (now - bucket.last > 15 * 60_000) agentBuckets.delete(ip);
+        }
+        for (const [ip, fails] of loginFails) {
+          const fresh = fails.filter((t) => now - t < LOGIN_WINDOW_MS);
+          if (fresh.length === 0) loginFails.delete(ip);
+          else loginFails.set(ip, fresh);
+        }
       }, 30_000);
       tickTimer.unref?.();
       pruneTimer = setInterval(() => {
         try {
           const cutoff = Date.now() - effective.retentionDays * 24 * 3600 * 1000;
           const removed = store.pruneOlderThan(cutoff);
-          if (removed > 0) log.info(`[prune] removed ${removed} stale metric rows`);
+          const sessions = store.deleteExpiredSessions();
+          const events = store.pruneResolvedEvents(cutoff);
+          if (removed > 0 || sessions > 0 || events > 0) {
+            log.info(`[prune] removed ${removed} metrics, ${sessions} sessions, ${events} resolved events`);
+          }
         } catch (err) {
           log.error(`[prune] ${err.stack ?? err}`);
         }
