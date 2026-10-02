@@ -12,6 +12,7 @@ const MIME = {
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
   '.woff2': 'font/woff2',
+  '.sh': 'text/x-shellscript; charset=utf-8',
 };
 
 // Returns true when the file was served; false lets the caller answer 404.

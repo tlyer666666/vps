@@ -284,6 +284,15 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         return await handleLogin(req, res, ip);
       }
       if (!path.startsWith('/api/')) {
+        // Distributable install assets so the panel one-liner works out of the box.
+        if (req.method === 'GET' && (path === '/install-agent.sh' || path === '/agent.sh')) {
+          const scriptsDir = config.scriptsDir ?? join(webDir, '..', '..', 'scripts');
+          const agentDir = config.agentDir ?? join(webDir, '..', '..', 'agent');
+          const target = path === '/install-agent.sh'
+            ? { dir: scriptsDir, file: '/install-agent.sh' }
+            : { dir: agentDir, file: '/vpswatch-agent.sh' };
+          if (serveStatic(target.dir, target.file, res)) return;
+        }
         if (req.method === 'GET' && serveStatic(webDir, path, res)) return;
         if (req.method === 'GET') {
           res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
