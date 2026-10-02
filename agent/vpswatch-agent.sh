@@ -239,11 +239,12 @@ sample() {
 }
 
 build_json() {
-  local swap_pair="" load_pair=""
+  local swap_pair="" load_pair="" host_pair=""
   [ -n "$SWAP_TOTAL" ] && swap_pair="\"swap_total\":$SWAP_TOTAL,\"swap_used\":${SWAP_USED:-0},"
   [ -n "${LOAD1:-}" ] && load_pair=",\"load1\":${LOAD1:-0},\"load5\":${LOAD5:-0},\"load15\":${LOAD15:-0}"
-  printf '{"hostname":"%s","version":"%s","uptime":%s,"cpu":{"usage_pct":%s,"cores":%s%s},"mem":{%s"total":%s,"used":%s},"disks":%s,"net":{"rx_bytes":%s,"tx_bytes":%s},"daily_rx":%s,"daily_tx":%s,"monthly_rx":%s,"monthly_tx":%s,"tcp_conns":%s,"processes":%s,"ts":%s}' \
-    "$HOSTNAME_OUT" "$VERSION" "${UPTIME:-0}" "$CPU_PCT" "$CORES" "$load_pair" \
+  [ -n "$HOSTNAME_OUT" ] && host_pair="\"hostname\":\"$HOSTNAME_OUT\","
+  printf '{%s"version":"%s","uptime":%s,"cpu":{"usage_pct":%s,"cores":%s%s},"mem":{%s"total":%s,"used":%s},"disks":%s,"net":{"rx_bytes":%s,"tx_bytes":%s},"daily_rx":%s,"daily_tx":%s,"monthly_rx":%s,"monthly_tx":%s,"tcp_conns":%s,"processes":%s,"ts":%s}' \
+    "$host_pair" "$VERSION" "${UPTIME:-0}" "$CPU_PCT" "$CORES" "$load_pair" \
     "$swap_pair" "${MEM_TOTAL:-0}" "${MEM_USED:-0}" \
     "$DISKS_JSON" "$NET_RX" "$NET_TX" \
     "$daily_rx" "$daily_tx" "$monthly_rx" "$monthly_tx" \

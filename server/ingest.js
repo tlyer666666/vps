@@ -105,7 +105,7 @@ function validate(report) {
   if (report.daily_tx != null && dailyTx === null) return 'daily_tx out of range';
 
   const hostname = optHostname(report.hostname);
-  if (report.hostname !== undefined && report.hostname !== null && hostname === null) {
+  if (report.hostname && hostname === null) {
     return 'hostname must match [A-Za-z0-9._-]{1,64}';
   }
 

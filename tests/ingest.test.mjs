@@ -45,6 +45,12 @@ test('rejects bad hostname characters and overlong names', () => {
   assert.equal(validateReport(validReport({ hostname: 'x'.repeat(65) })).ok, false);
 });
 
+test('empty-string hostname is treated as absent, not an error', () => {
+  const r = validateReport(validReport({ hostname: '' }));
+  assert.equal(r.ok, true);
+  assert.equal(r.value.hostname, null);
+});
+
 test('rejects empty or oversized disk array and bad disk entries', () => {
   assert.equal(validateReport(validReport({ disks: [] })).ok, false);
   assert.equal(validateReport(validReport({
