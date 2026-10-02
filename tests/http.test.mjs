@@ -128,6 +128,7 @@ test('full report pipeline: admin creates server, agent reports, overview shows 
     }));
     assert.equal(res.status, 200, `report ${i}`);
     assert.deepEqual(await res.json(), { ok: true });
+    await new Promise((r) => setTimeout(r, 25)); // distinct server-side ts so dtSec > 0
   }
 
   const overview = await (await h.call('/api/overview')).json();
@@ -427,5 +428,129 @@ test('session cookie gains Secure flag when HTTPS is detected (review finding 4)
   assert.equal(res.status, 200);
   const setCookie = res.headers.get('set-cookie');
   assert.match(setCookie, /Secure/i, 'login over detected HTTPS must set Secure');
+  h.close();
+});
+
+// ---- iteration 1: settings/server input validation ----
+
+test('PUT settings rejects type-broken payloads instead of silently killing alerts', async () => {
+  const h = await startApp();
+  await login(h);
+  const bad = [
+    { thresholds: 'banana' },
+    { thresholds: { cpu: 0 } },                    // empty form field -> Number('') = 0
+    { thresholds: { cpu: 101 } },
+    { thresholds: { consecutive: 0 } },
+    { thresholds: { expiryDays: -1 } },
+    { retentionDays: 0 },                          // prune cutoff = now -> wipes all history
+    { retentionDays: 'banana' },
+    { notifyCooldownMin: 'abc' },
+    { notifyCooldownMin: 0 },
+    { webhookUrl: 'ftp://x' },
+    { webhookUrl: 123 },
+  ];
+  for (const body of bad) {
+    const res = await h.call('/api/admin/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+  }
+  // engine thresholds untouched by rejected payloads
+  assert.equal(h.engine.thresholds.cpu, 90);
+  h.close();
+});
+
+test('PUT settings accepts boundary-valid values', async () => {
+  const h = await startApp();
+  await login(h);
+  const res = await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      thresholds: { cpu: 1, mem: 100, disk: 99, consecutive: 1, expiryDays: 0 },
+      notifyCooldownMin: 1,
+      retentionDays: 1,
+      webhookUrl: 'https://hooks.example.com/abc',
+    }),
+  });
+  assert.equal(res.status, 200);
+  const after = await (await h.call('/api/admin/settings')).json();
+  assert.equal(after.thresholds.cpu, 1);
+  assert.equal(after.thresholds.expiryDays, 0);
+  assert.equal(after.retentionDays, 1);
+  h.close();
+});
+
+test('server create/update validate field types (review finding 2)', async () => {
+  const h = await startApp();
+  await login(h);
+  const badBodies = [
+    { name: '' },
+    { name: '   ' },
+    { name: 'a'.repeat(101) },
+    { name: 'ok', intervalSec: 'abc' },
+    { name: 'ok', intervalSec: 0 },
+    { name: 'ok', intervalSec: null },
+    { name: 'ok', expiresAt: 'next tuesday' },
+    { name: 'ok', priceCny: 'cheap' },
+    { name: 'ok', tag: 42 },
+  ];
+  for (const body of badBodies) {
+    const res = await h.call('/api/admin/servers', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+  }
+
+  const { id } = await (await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'good', intervalSec: 10 }),
+  })).json();
+  const badPatches = [{ intervalSec: 'abc' }, { intervalSec: null }, { expiresAt: 'x' }, { priceCny: [] }];
+  for (const body of badPatches) {
+    const res = await h.call(`/api/admin/servers/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(res.status, 400, `expected 400 for PATCH ${JSON.stringify(body)}`);
+  }
+  h.close();
+});
+
+test('GET /api/admin/servers and /:id per spec §3.2 (review finding 10)', async () => {
+  const h = await startApp();
+  await login(h);
+  const { id, token } = await (await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'listed' }),
+  })).json();
+  const list = await (await h.call('/api/admin/servers')).json();
+  assert.equal(list.length, 1);
+  assert.ok(!JSON.stringify(list).includes(token), 'token must never appear in listings');
+  const one = await (await h.call(`/api/admin/servers/${id}`)).json();
+  assert.equal(one.name, 'listed');
+  assert.equal((await h.call('/api/admin/servers/9999')).status, 404);
+  h.close();
+});
+
+test('events limit clamps negatives and large values (review finding 6)', async () => {
+  const h = await startApp();
+  await login(h);
+  for (const type of ['cpu', 'mem', 'disk']) {
+    h.store.openEvent({ serverId: 1, type, level: 'critical', message: `e-${type}` }, 1000);
+  }
+  const big = await (await h.call('/api/events?limit=999999')).json();
+  assert.equal(big.length, 3, 'limit clamps to 1000, still returns all 3');
+  const neg = await (await h.call('/api/events?limit=-1')).json();
+  assert.equal(neg.length, 3, 'negative limit must not become unlimited/0/error');
+  const two = await (await h.call('/api/events?limit=2')).json();
+  assert.equal(two.length, 2);
   h.close();
 });

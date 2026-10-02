@@ -88,11 +88,19 @@ export class AlertEngine {
   }
 
   #open(serverRow, st, type, level, message, nowMs, cooldownMs = this.cooldownMs) {
-    const id = this.store.openEvent({ serverId: serverRow.id, type, level, message }, nowMs);
+    const event = this.store.openEvent({ serverId: serverRow.id, type, level, message }, nowMs);
+    if (event.existed) {
+      // Already open (e.g. hub restarted while the event was open): suppress
+      // the duplicate webhook by seeding the cooldown clock from the event.
+      if (st.lastNotifyAt[type] === undefined) {
+        st.lastNotifyAt[type] = event.startedAt;
+      }
+      return;
+    }
     const last = st.lastNotifyAt[type];
     if (last === undefined || nowMs - last >= cooldownMs) {
       st.lastNotifyAt[type] = nowMs;
-      this.onNotify({ id, type, level, message, startedAt: nowMs }, serverRow);
+      this.onNotify({ id: event.id, type, level, message, startedAt: nowMs }, serverRow);
     }
   }
 

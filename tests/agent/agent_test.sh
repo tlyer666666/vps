@@ -199,4 +199,28 @@ assert_eq "empty /proc still prints payload, exit 0" "0" "$?"
   bash "$AGENT" --print-payload 2>/dev/null )
 assert_eq "unwritable state dir still prints payload, exit 0" "0" "$?"
 
+# ---- 7. corrupted state file degrades safely (iteration 1 finding 7) -------
+mkdir -p "$TMP/corrupt"
+printf 'prev_rx=abc\nprev_tx=\ncorruptline\nprev_cpu_total=xyz\nday=garbage\nmonth=1\n' > "$TMP/corrupt/state"
+( export PROC="$PROC" STATE_FILE="$TMP/corrupt/state" DF_CMD="$TMP/fake-df"
+  export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
+  unset SERVER_URL TOKEN
+  bash "$AGENT" --print-payload >"$TMP/corrupt-payload.json" 2>/dev/null )
+assert_eq "corrupted state still prints payload, exit 0" "0" "$?"
+if node -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$TMP/corrupt-payload.json" 2>/dev/null; then
+  ok "corrupted state yields valid JSON"
+else
+  fail "corrupted state yields valid JSON" "unparseable payload"
+fi
+assert_eq "corrupted state resets daily ledger" "0" "$(jget "$TMP/corrupt-payload.json" daily_rx)"
+assert_eq "corrupted state resets cpu to first-sample" "0" "$(jget "$TMP/corrupt-payload.json" cpu.usage_pct)"
+
+# ---- 8. INTERVAL from conf/env is clamped (iteration 1 finding 4) ----------
+( export PROC="$PROC" STATE_FILE="$TMP/state-clamp" DF_CMD="$TMP/fake-df"
+  export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
+  export INTERVAL=abc
+  unset SERVER_URL TOKEN
+  bash "$AGENT" --print-payload >/dev/null 2>&1 )
+assert_eq "INTERVAL=abc does not crash" "0" "$?"
+
 finish

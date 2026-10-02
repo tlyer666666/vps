@@ -209,18 +209,29 @@ export function openStore(dbPath) {
       return db.prepare('DELETE FROM metrics WHERE ts < ?').run(cutoffMs).changes;
     },
 
+    deleteExpiredSessions(nowMs = Date.now()) {
+      return db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(nowMs).changes;
+    },
+
+    pruneResolvedEvents(cutoffMs) {
+      return db.prepare('DELETE FROM events WHERE resolved_at IS NOT NULL AND resolved_at < ?')
+        .run(cutoffMs).changes;
+    },
+
     // ---- events ----
 
     openEvent({ serverId, type, level, message }, nowMs = Date.now()) {
       const existing = db.prepare(
-        'SELECT id FROM events WHERE server_id = ? AND type = ? AND resolved_at IS NULL'
+        'SELECT id, started_at FROM events WHERE server_id = ? AND type = ? AND resolved_at IS NULL'
       ).get(serverId, type);
-      if (existing) return existing.id;
+      if (existing) {
+        return { id: existing.id, startedAt: existing.started_at, existed: true };
+      }
       const res = db.prepare(`
         INSERT INTO events (server_id, type, level, message, started_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(serverId, type, level, message, nowMs);
-      return Number(res.lastInsertRowid);
+      return { id: Number(res.lastInsertRowid), startedAt: nowMs, existed: false };
     },
 
     resolveEvent(serverId, type, nowMs = Date.now()) {

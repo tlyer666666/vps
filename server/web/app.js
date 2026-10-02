@@ -460,6 +460,8 @@ if (typeof document !== 'undefined') {
     if (state.es) return;
     const es = new EventSource('/api/stream');
     es.addEventListener('overview', (e) => {
+      // SSE is alive again — the degraded polling loop must stop.
+      if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
       state.servers = JSON.parse(e.data);
       if (location.hash === '' || location.hash === '#/') renderOverview();
       if (state.detail.id && location.hash.startsWith('#/server/')) renderTopbar();

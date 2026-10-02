@@ -114,11 +114,15 @@ test('openEvent is idempotent while open; reopen after resolve creates new event
   const { id } = s.createServer({ name: 'a' });
   const e1 = s.openEvent({ serverId: id, type: 'cpu', level: 'critical', message: 'hi', }, 1000);
   const e1again = s.openEvent({ serverId: id, type: 'cpu', level: 'critical', message: 'hi' }, 2000);
-  assert.equal(e1, e1again);
+  assert.equal(e1.id, e1again.id, 'same open event must be reused');
+  assert.equal(e1.existed, false);
+  assert.equal(e1again.existed, true, 'reuse must flag existed for restart-safe notify suppression');
+  assert.equal(e1again.startedAt, 1000, 'reuse reports the original start time');
   const resolved = s.resolveEvent(id, 'cpu', 3000);
   assert.equal(resolved, 1);
   const e2 = s.openEvent({ serverId: id, type: 'cpu', level: 'critical', message: 'hi' }, 4000);
-  assert.notEqual(e2, e1);
+  assert.notEqual(e2.id, e1.id);
+  assert.equal(e2.existed, false);
   const rows = s.listEvents({ serverId: id });
   assert.equal(rows.length, 2);
   assert.equal(rows[0].startedAt >= rows[1].startedAt, true); // newest first

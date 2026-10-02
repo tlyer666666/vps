@@ -16,6 +16,10 @@ CONF_FILE="${VPSWATCH_CONF:-/etc/vpswatch/agent.conf}"
 SERVER_URL="${SERVER_URL:-}"
 TOKEN="${TOKEN:-}"
 INTERVAL="${INTERVAL:-10}"
+# A broken interval from a hand-edited conf must not turn the loop into a
+# sample/report spin loop — clamp to a sane default instead.
+case "$INTERVAL" in (*[!0-9]*|'') INTERVAL=10 ;; esac
+[ "$INTERVAL" -ge 1 ] 2>/dev/null || INTERVAL=10
 PROC="${PROC:-/proc}"
 STATE_FILE="${STATE_FILE:-/var/lib/vpswatch/state}"
 DF_CMD="${DF_CMD:-df}"
@@ -152,6 +156,18 @@ load_state() {
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
     . "$STATE_FILE"
+    # A hand-edited or corrupt state file must degrade to first-sample
+    # behavior, never feed garbage into arithmetic (crash loop under set -u).
+    case "$prev_cpu_total" in (*[!0-9]*|'') prev_cpu_total="" ;; esac
+    case "$prev_cpu_idle" in (*[!0-9]*|'') prev_cpu_idle="" ;; esac
+    case "$prev_rx" in (*[!0-9]*|'') prev_rx="" ;; esac
+    case "$prev_tx" in (*[!0-9]*|'') prev_tx="" ;; esac
+    case "$day" in (*[!0-9]*|'') day="" ;; esac
+    case "$month" in (*[!0-9]*|'') month="" ;; esac
+    case "$daily_rx" in (*[!0-9]*|'') daily_rx=0 ;; esac
+    case "$daily_tx" in (*[!0-9]*|'') daily_tx=0 ;; esac
+    case "$monthly_rx" in (*[!0-9]*|'') monthly_rx=0 ;; esac
+    case "$monthly_tx" in (*[!0-9]*|'') monthly_tx=0 ;; esac
   fi
 }
 
@@ -282,7 +298,7 @@ case "$MODE" in
       if ! report "$(build_json)"; then
         log "report failed (will retry next interval)"
       fi
-      sleep "$INTERVAL"
+      sleep "$INTERVAL" 2>/dev/null || sleep 10
     done
     ;;
 esac

@@ -88,6 +88,8 @@ fi
 
 [ -n "$SERVER_URL" ] || { echo "error: --server is required" >&2; usage; exit 1; }
 [ -n "$TOKEN" ] || { echo "error: --token is required" >&2; usage; exit 1; }
+case "$INTERVAL" in (*[!0-9]*|'') echo "error: --interval must be a positive integer (seconds)" >&2; usage; exit 1 ;; esac
+[ "$INTERVAL" -ge 1 ] || { echo "error: --interval must be >= 1" >&2; usage; exit 1; }
 
 echo "installing vpswatch agent..."
 mkdir -p "$(dirname "$BIN")" "$(dirname "$CONF")" "$STATE_DIR" "$(dirname "$LOG_FILE")"

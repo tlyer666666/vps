@@ -41,6 +41,17 @@ PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12345 --password dummy
 [ -f "$TMP/root2/opt/vpswatch/scripts/install-agent.sh" ] && ok "scripts tree installed" || fail "scripts tree" "missing"
 [ -f "$TMP/root2/opt/vpswatch/agent/vpswatch-agent.sh" ] && ok "agent tree installed" || fail "agent tree" "missing"
 
+# ---- 3c. reinstall (upgrade) must not nest trees (iteration 1 finding 3)
+PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12346 --password dummy123 --no-start >/dev/null 2>&1
+[ -f "$TMP/root2/opt/vpswatch/server/main.js" ] && ok "reinstall keeps main.js top-level" || fail "reinstall" "nested server/server"
+[ ! -d "$TMP/root2/opt/vpswatch/server/server" ] && ok "reinstall does not nest server dir" || fail "reinstall nest" "server/server exists"
+
+# ---- 3d. installer rejects non-numeric interval (iteration 1 finding 4)
+bash scripts/install-agent.sh --server http://x --token t --interval 10s >/dev/null 2>&1
+[ $? -ne 0 ] && ok "non-numeric --interval rejected" || fail "interval validation" "accepted 10s"
+bash scripts/install-agent.sh --server http://x --token t --interval 0 >/dev/null 2>&1
+[ $? -ne 0 ] && ok "zero --interval rejected" || fail "interval validation" "accepted 0"
+
 # ---- 4. agent install with temp PREFIX (no systemd, no start) --------------
 PREFIX="$TMP/root" bash scripts/install-agent.sh \
   --server http://hub.example:3577 --token tok123 --interval 15 --no-start >/dev/null 2>&1

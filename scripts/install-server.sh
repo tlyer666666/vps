@@ -72,6 +72,8 @@ fi
 
 echo "installing vpswatch hub..."
 mkdir -p "$APP_DIR" "$(dirname "$CONF")" "${PREFIX}/var/lib/vpswatch"
+# Reinstall (upgrade) must replace the trees, not nest them inside old ones.
+rm -rf "$APP_DIR/server" "$APP_DIR/scripts" "$APP_DIR/agent"
 cp -R "$SRC_DIR" "$APP_DIR/server"
 # The hub serves /install-agent.sh and /agent.sh from these trees — without
 # them the panel's copy-paste agent one-liner 404s in the installed layout.
