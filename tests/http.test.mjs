@@ -372,6 +372,65 @@ test('password change rejects short or missing passwords', async () => {
   h.close();
 });
 
+test('password change invalidates all existing sessions (iteration 3)', async () => {
+  const h = await startApp();
+  await login(h);
+  // a second session (another browser) is also logged in
+  const cookie2 = await fetch(`${h.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: PASSWORD }),
+  }).then((r) => r.headers.get('set-cookie').split(';')[0]);
+
+  await h.call('/api/admin/password', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'brand-new-pw' }),
+  });
+
+  const stolen = await fetch(`${h.base}/api/overview`, { headers: { cookie: cookie2 } });
+  assert.equal(stolen.status, 401, 'rotating the password must kill every session');
+  const own = await h.call('/api/overview');
+  assert.equal(own.status, 401, 'current session is invalidated too');
+  h.close();
+});
+
+test('cross-site mutations are rejected by Origin check (iteration 3 CSRF hardening)', async () => {
+  const h = await startApp();
+  await login(h);
+
+  // stolen-but-valid session cookie + cross-site Origin → 403
+  const cookie2 = await fetch(`${h.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: PASSWORD }),
+  }).then((r) => r.headers.get('set-cookie').split(';')[0]);
+  const evil = await fetch(`${h.base}/api/admin/password`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      origin: 'https://evil.example',
+      cookie: cookie2,
+    },
+    body: JSON.stringify({ password: 'hijacked-pw1' }),
+  });
+  assert.equal(evil.status, 403, 'cross-origin mutation must be 403 even with a stolen session');
+
+  const crossLogin = await fetch(`${h.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  assert.equal(crossLogin.status, 403, 'login mutation is guarded too');
+
+  // same-origin (or no Origin, like curl/agents) keeps working
+  const same = await h.call('/api/overview');
+  assert.equal(same.status, 200, 'same-origin requests are unaffected');
+  const noOrigin = await report(h, 'x', reportBody());
+  assert.equal(noOrigin.status, 401, 'agent report has no Origin; auth still applies normally');
+  h.close();
+});
+
 test('trust-proxy takes client IP from X-Forwarded-For (review finding 3)', async () => {
   const store = openStore(':memory:');
   store.setAdminPasswordHash(await hashPassword(PASSWORD));

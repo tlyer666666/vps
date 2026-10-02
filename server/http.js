@@ -195,7 +195,23 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     return store.getSession(token) !== null;
   }
 
+  // CSRF defense-in-depth: SameSite=Lax covers modern browsers, but the
+  // Chrome "Lax+POST" 2-minute exception plus an enctype=text/plain form can
+  // smuggle JSON. When the browser advertises an Origin/Referer that does not
+  // match Host, refuse the mutation. curl/agents send neither → unaffected.
+  function crossOriginMutation(req) {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return false;
+    const src = req.headers.origin ?? req.headers.referer;
+    if (!src) return false;
+    try {
+      return new URL(src).host !== req.headers.host;
+    } catch {
+      return true;
+    }
+  }
+
   async function handleLogin(req, res, ip) {
+    if (crossOriginMutation(req)) return json(res, 403, { error: 'cross-origin request blocked' });
     if (loginBlocked(ip)) return json(res, 429, { error: 'too many attempts' });
     const { raw } = await readBody(req);
     let body = {};
@@ -381,6 +397,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         return json(res, 405, { error: 'method not allowed' });
       }
       if (!isAuthed(req)) return json(res, 401, { error: 'unauthorized' });
+      if (crossOriginMutation(req)) return json(res, 403, { error: 'cross-origin request blocked' });
 
       if (req.method === 'GET' && path === '/api/overview') {
         return json(res, 200, buildOverview());
@@ -474,6 +491,10 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         const pw = typeof body.password === 'string' ? body.password : '';
         if (pw.length < 8) return json(res, 400, { error: 'password must be at least 8 characters' });
         store.setAdminPasswordHash(await hashPassword(pw));
+        // Rotating the password must evict every existing session cookie —
+        // otherwise a stolen cookie survives the rotation for its full TTL.
+        store.deleteAllSessions();
+        res.setHeader('set-cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
         return json(res, 200, { ok: true });
       }
       return json(res, 404, { error: 'not found' });

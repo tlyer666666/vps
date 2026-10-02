@@ -253,11 +253,13 @@ build_json() {
 
 report() {
   local json="$1"
-  "$CURL_CMD" -sf -m 5 -X POST \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    --data "$json" \
-    "$SERVER_URL/api/agent/report" >/dev/null
+  # Token reaches curl via stdin config (-K -) so it never appears in
+  # /proc/*/cmdline (ps) where any local user could read it.
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
+    | "$CURL_CMD" -K - -sf -m 5 -X POST \
+      -H "Content-Type: application/json" \
+      --data "$json" \
+      "$SERVER_URL/api/agent/report" >/dev/null
 }
 
 case "$MODE" in

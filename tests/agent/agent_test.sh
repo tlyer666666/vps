@@ -62,10 +62,19 @@ chmod +x "$TMP/fake-df"
 cat > "$TMP/fake-curl-ok" <<'EOF'
 #!/usr/bin/env bash
 cat > /dev/null
-echo "reported: $*" >> "$FAKE_CURL_LOG"
+echo "args: $*" >> "$FAKE_CURL_LOG"
 exit 0
 EOF
 chmod +x "$TMP/fake-curl-ok"
+
+# records stdin (curl -K - reads the config from there) without leaking it to logs
+cat > "$TMP/fake-curl-stdin" <<'EOF'
+#!/usr/bin/env bash
+cat > "$FAKE_CURL_STDIN"
+echo "args: $*" >> "$FAKE_CURL_LOG"
+exit 0
+EOF
+chmod +x "$TMP/fake-curl-stdin"
 
 cat > "$TMP/fake-curl-fail" <<'EOF'
 #!/usr/bin/env bash
@@ -177,13 +186,22 @@ assert_eq "curl failure exit code 2" "2" "$?"
 
 FAKE_CURL_LOG="$TMP/curl.log"
 export FAKE_CURL_LOG
+FAKE_CURL_STDIN="$TMP/curl-stdin.txt"
+export FAKE_CURL_STDIN
+: > "$FAKE_CURL_LOG"; : > "$FAKE_CURL_STDIN"
 ( export SERVER_URL="http://127.0.0.1:1" TOKEN="abc123" PROC="$PROC" STATE_FILE="$TMP/state4"
-  export DF_CMD="$TMP/fake-df" CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date"
+  export DF_CMD="$TMP/fake-df" CURL_CMD="$TMP/fake-curl-stdin" DATE_CMD="$TMP/fake-date"
   export HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
   bash "$AGENT" --once >/dev/null 2>&1 )
 assert_eq "curl success exit code 0" "0" "$?"
 grep -q "api/agent/report" "$TMP/curl.log" && ok "posts to /api/agent/report" || fail "posts to /api/agent/report" "$(cat "$TMP/curl.log" 2>/dev/null)"
 grep -q -- "-H" "$TMP/curl.log" && ok "sends headers" || fail "sends headers" "no -H found"
+grep -q 'Authorization: Bearer abc123' "$FAKE_CURL_STDIN" && ok "token reaches curl via stdin config" || fail "token via stdin" "$(cat "$FAKE_CURL_STDIN" 2>/dev/null)"
+if grep -q 'abc123' "$TMP/curl.log"; then
+  fail "token stays off argv" "token leaked into process args"
+else
+  ok "token stays off argv"
+fi
 
 # ---- 6. degraded environments must not crash (set -u) ----------------------
 mkdir -p "$TMP/empty-proc"

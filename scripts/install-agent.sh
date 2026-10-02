@@ -52,6 +52,22 @@ ExecStart=$BIN
 Restart=always
 RestartSec=5
 User=$RUN_USER
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=-$STATE_DIR
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -90,6 +106,9 @@ fi
 [ -n "$TOKEN" ] || { echo "error: --token is required" >&2; usage; exit 1; }
 case "$INTERVAL" in (*[!0-9]*|'') echo "error: --interval must be a positive integer (seconds)" >&2; usage; exit 1 ;; esac
 [ "$INTERVAL" -ge 1 ] || { echo "error: --interval must be >= 1" >&2; usage; exit 1; }
+if [ "$RUN_USER" != "root" ]; then
+  id -u "$RUN_USER" >/dev/null 2>&1 || { echo "error: user '$RUN_USER' does not exist" >&2; usage; exit 1; }
+fi
 
 echo "installing vpswatch agent..."
 mkdir -p "$(dirname "$BIN")" "$(dirname "$CONF")" "$STATE_DIR" "$(dirname "$LOG_FILE")"
@@ -112,6 +131,14 @@ INTERVAL="$INTERVAL"
 STATE_FILE="$STATE_DIR/state"
 EOF
 chmod 600 "$CONF"
+# Least privilege: the agent needs root nowhere (df and /proc are
+# world-readable), so hand the conf and ledger to the service user.
+if [ "$RUN_USER" != "root" ] && [ "$(id -u)" = "0" ]; then
+  chown -R "$RUN_USER" "$STATE_DIR"
+  chown "$RUN_USER" "$CONF"
+elif [ "$RUN_USER" != "root" ]; then
+  echo "warning: not running as root — run 'chown -R $RUN_USER $STATE_DIR $CONF' manually" >&2
+fi
 
 [ "$NO_START" -eq 1 ] && { echo "installed (not started: --no-start)"; exit 0; }
 

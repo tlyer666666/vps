@@ -25,6 +25,14 @@ echo "$unit" | grep -q 'Restart=always' && ok "agent unit restarts always" || fa
 unit2=$(bash scripts/install-server.sh --print-unit 2>/dev/null)
 echo "$unit2" | grep -q 'ExecStart=.*main.js' && ok "server unit runs main.js" || fail "server unit ExecStart" "$unit2"
 echo "$unit2" | grep -q 'Restart=always' && ok "server unit restarts always" || fail "server unit Restart" "$unit2"
+echo "$unit" | grep -q 'NoNewPrivileges=true' && ok "agent unit sandboxed (NoNewPrivileges)" || fail "agent sandbox" "missing"
+echo "$unit" | grep -q 'ProtectSystem=strict' && ok "agent unit ProtectSystem" || fail "agent ProtectSystem" "missing"
+echo "$unit2" | grep -q 'NoNewPrivileges=true' && ok "server unit sandboxed" || fail "server sandbox" "missing"
+echo "$unit2" | grep -vq 'MemoryDenyWriteExecute' && ok "hub unit avoids MemoryDenyWriteExecute (V8 JIT)" || fail "hub unit" "MDWE would crash node"
+
+# ---- 3a. installer validates --user (iteration 3 finding 4) -----------------
+bash scripts/install-agent.sh --server http://x --token t --user no-such-user-xyz >/dev/null 2>&1
+[ $? -ne 0 ] && ok "unknown --user rejected" || fail "--user validation" "accepted unknown user"
 
 # ---- 3. missing required args ---------------------------------------------
 err=$(bash scripts/install-agent.sh --server http://x 2>&1 >/dev/null)

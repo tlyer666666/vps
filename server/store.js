@@ -255,6 +255,10 @@ export function openStore(dbPath) {
       return prep('DELETE FROM sessions WHERE expires_at <= ?').run(nowMs).changes;
     },
 
+    deleteAllSessions() {
+      return prep('DELETE FROM sessions').run().changes;
+    },
+
     pruneResolvedEvents(cutoffMs) {
       return prep('DELETE FROM events WHERE resolved_at IS NOT NULL AND resolved_at < ?')
         .run(cutoffMs).changes;
