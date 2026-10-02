@@ -183,3 +183,31 @@ test('forget drops per-server memory when a server is deleted (iteration 2)', ()
   assert.equal(engine.state(server.id), null);
   store.close();
 });
+
+test('traffic quota: exceeding opens warning, dropping resolves (v1.1)', () => {
+  const { store, engine, notified, server } = setup();
+  const GB = 1024 ** 3;
+  store.updateServer(server.id, { monthlyQuotaBytes: 100 * GB });
+  const quotaServer = store.getServer(server.id);
+
+  engine.checkQuota(quotaServer, { monthlyRx: 60 * GB, monthlyTx: 50 * GB }, 1000);
+  const over = store.listEvents({ serverId: server.id }).filter((e) => e.type === 'traffic');
+  assert.equal(over.length, 1);
+  assert.equal(over[0].level, 'warning');
+  assert.match(over[0].message, /110\.0 GB/);
+  assert.equal(notified.length, 1);
+
+  // still over: no duplicate notify, event stays open
+  engine.checkQuota(quotaServer, { monthlyRx: 95 * GB, monthlyTx: 10 * GB }, 2000);
+  assert.equal(notified.length, 1);
+
+  // back under quota: resolves
+  engine.checkQuota(quotaServer, { monthlyRx: 10 * GB, monthlyTx: 5 * GB }, 3000);
+  assert.equal(store.listEvents({ serverId: server.id }).filter((e) => e.type === 'traffic' && e.resolvedAt === null).length, 0);
+
+  // no quota set: never alerts
+  store.updateServer(server.id, { monthlyQuotaBytes: null });
+  engine.checkQuota(store.getServer(server.id), { monthlyRx: 999 * GB, monthlyTx: 0 }, 4000);
+  assert.equal(store.listEvents({ serverId: server.id }).filter((e) => e.type === 'traffic' && e.resolvedAt === null).length, 0);
+  store.close();
+});

@@ -1,5 +1,7 @@
 // Alert state machine. Persists event open/resolve through the store; the
 // caller supplies onNotify — the engine itself never sends anything.
+import { fmtBytes } from './web/charts.js';
+
 const DAY_MS = 24 * 3600 * 1000;
 
 const LABELS = { cpu: 'CPU 使用率', mem: '内存使用率', disk: '磁盘使用率', offline: '离线', expiry: '到期' };
@@ -46,6 +48,22 @@ export class AlertEngine {
         `${serverRow.name} ${LABELS.disk} ${diskPct.toFixed(1)}%(阈值 ${this.thresholds.disk}%)`, nowMs);
     } else {
       this.#resolve(serverRow.id, 'disk');
+    }
+  }
+
+  checkQuota(serverRow, metric, nowMs = Date.now()) {
+    const st = this.#stateFor(serverRow.id, serverRow.intervalSec);
+    const quota = serverRow.monthlyQuotaBytes;
+    if (quota == null || quota <= 0) {
+      this.#resolve(serverRow.id, 'traffic', nowMs);
+      return;
+    }
+    const used = (metric.monthlyRx ?? 0) + (metric.monthlyTx ?? 0);
+    if (used > quota) {
+      this.#open(serverRow, st, 'traffic', 'warning',
+        `${serverRow.name} 月流量 ${fmtBytes(used)} 已超过配额 ${fmtBytes(quota)}`, nowMs, DAY_MS);
+    } else {
+      this.#resolve(serverRow.id, 'traffic', nowMs);
     }
   }
 

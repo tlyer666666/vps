@@ -4,7 +4,8 @@ import { newToken, sha256hex, safeEqualStr } from './secure.js';
 
 const SERVER_COLS = `id, name, tag, provider, region, price_cny AS priceCny,
   expires_at AS expiresAt, notes, interval_sec AS intervalSec,
-  sort_order AS sortOrder, created_at AS createdAt`;
+  sort_order AS sortOrder, created_at AS createdAt,
+  group_name AS groupName, monthly_quota_bytes AS monthlyQuotaBytes`;
 
 const METRIC_COLS = `server_id AS serverId, ts, cpu_pct AS cpuPct,
   mem_used AS memUsed, mem_total AS memTotal, swap_used AS swapUsed, swap_total AS swapTotal,
@@ -22,6 +23,7 @@ const METRIC_FIELDS = [
   ['rxBytes', 'rx_bytes'], ['txBytes', 'tx_bytes'],
   ['rxSpeed', 'rx_speed'], ['txSpeed', 'tx_speed'],
   ['dailyRx', 'daily_rx'], ['dailyTx', 'daily_tx'],
+  ['monthlyRx', 'monthly_rx'], ['monthlyTx', 'monthly_tx'],
   ['tcpConns', 'tcp_conns'], ['processes', 'processes'], ['uptimeSec', 'uptime_sec'],
 ];
 
@@ -29,6 +31,15 @@ const SERVER_PATCH = [
   ['name', 'name'], ['tag', 'tag'], ['provider', 'provider'], ['region', 'region'],
   ['priceCny', 'price_cny'], ['expiresAt', 'expires_at'], ['notes', 'notes'],
   ['intervalSec', 'interval_sec'], ['sortOrder', 'sort_order'],
+  ['groupName', 'group_name'], ['monthlyQuotaBytes', 'monthly_quota_bytes'],
+];
+
+const PROBE_COLS = `id, name, type, target, interval_sec AS intervalSec,
+  timeout_sec AS timeoutSec, enabled, created_at AS createdAt`;
+
+const PROBE_PATCH = [
+  ['name', 'name'], ['type', 'type'], ['target', 'target'],
+  ['intervalSec', 'interval_sec'], ['timeoutSec', 'timeout_sec'], ['enabled', 'enabled'],
 ];
 
 export function openStore(dbPath) {
@@ -115,7 +126,39 @@ export function openStore(dbPath) {
           expires_at INTEGER NOT NULL,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS probes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          type TEXT NOT NULL,
+          target TEXT NOT NULL,
+          interval_sec INTEGER NOT NULL DEFAULT 30,
+          timeout_sec INTEGER NOT NULL DEFAULT 5,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS probe_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          probe_id INTEGER NOT NULL,
+          ts INTEGER NOT NULL,
+          ok INTEGER NOT NULL,
+          latency_ms REAL,
+          error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_probe_results ON probe_results(probe_id, ts);
       `);
+      // v1.1 migrations for pre-existing databases (idempotent).
+      for (const stmt of [
+        "ALTER TABLE servers ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
+        'ALTER TABLE servers ADD COLUMN monthly_quota_bytes INTEGER',
+        'ALTER TABLE metrics ADD COLUMN monthly_rx INTEGER',
+        'ALTER TABLE metrics ADD COLUMN monthly_tx INTEGER',
+      ]) {
+        try {
+          db.exec(stmt);
+        } catch (err) {
+          if (!/duplicate column/i.test(err.message)) throw err;
+        }
+      }
     },
 
     close() {
@@ -125,15 +168,17 @@ export function openStore(dbPath) {
     // ---- servers ----
 
     createServer({ name, tag = '', provider = '', region = '', priceCny = null,
-      expiresAt = null, notes = '', intervalSec = 10, sortOrder = 0 } = {}) {
+      expiresAt = null, notes = '', intervalSec = 10, sortOrder = 0,
+      groupName = '', monthlyQuotaBytes = null } = {}) {
       const token = newToken();
       const now = Date.now();
       const res = prep(`
         INSERT INTO servers (name, tag, provider, region, price_cny, expires_at, notes,
-                             token_hash, interval_sec, sort_order, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             token_hash, interval_sec, sort_order, created_at,
+                             group_name, monthly_quota_bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(name, tag, provider, region, priceCny, expiresAt, notes,
-        sha256hex(token), intervalSec, sortOrder, now);
+        sha256hex(token), intervalSec, sortOrder, now, groupName, monthlyQuotaBytes);
       return { id: Number(res.lastInsertRowid), token };
     },
 
@@ -262,6 +307,115 @@ export function openStore(dbPath) {
     pruneResolvedEvents(cutoffMs) {
       return prep('DELETE FROM events WHERE resolved_at IS NOT NULL AND resolved_at < ?')
         .run(cutoffMs).changes;
+    },
+
+    // ---- probes (v1.1) ----
+
+    createProbe({ name, type, target, intervalSec = 30, timeoutSec = 5, enabled = 1 } = {}) {
+      const res = prep(`
+        INSERT INTO probes (name, type, target, interval_sec, timeout_sec, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(name, type, target, intervalSec, timeoutSec, enabled ? 1 : 0, Date.now());
+      return store.getProbe(Number(res.lastInsertRowid));
+    },
+
+    listProbes() {
+      return prep(`SELECT ${PROBE_COLS} FROM probes ORDER BY id`).all();
+    },
+
+    getProbe(id) {
+      return prep(`SELECT ${PROBE_COLS} FROM probes WHERE id = ?`).get(id) ?? null;
+    },
+
+    updateProbe(id, patch = {}) {
+      const sets = [];
+      const vals = [];
+      for (const [key, col] of PROBE_PATCH) {
+        if (key in patch) {
+          sets.push(`${col} = ?`);
+          vals.push(patch[key]);
+        }
+      }
+      if (!sets.length) return;
+      vals.push(id);
+      db.prepare(`UPDATE probes SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+    },
+
+    deleteProbe(id) {
+      prep('DELETE FROM probe_results WHERE probe_id = ?').run(id);
+      prep('DELETE FROM probes WHERE id = ?').run(id);
+    },
+
+    insertProbeResult(probeId, r = {}) {
+      prep('INSERT INTO probe_results (probe_id, ts, ok, latency_ms, error) VALUES (?, ?, ?, ?, ?)')
+        .run(probeId, r.ts, r.ok ? 1 : 0, r.latencyMs ?? null, r.error ?? null);
+    },
+
+    latestProbeResults() {
+      const rows = prep(`
+        SELECT pr.id, pr.probe_id AS probeId, pr.ts, pr.ok, pr.latency_ms AS latencyMs, pr.error
+        FROM probe_results pr
+        JOIN (SELECT probe_id, MAX(ts) AS mts FROM probe_results GROUP BY probe_id) latest
+          ON pr.probe_id = latest.probe_id AND pr.ts = latest.mts
+      `).all();
+      const map = new Map();
+      for (const row of rows) map.set(row.probeId, row);
+      return map;
+    },
+
+    getProbeHistory(probeId, fromMs, toMs, maxPoints = 400) {
+      const total = prep('SELECT COUNT(*) AS c FROM probe_results WHERE probe_id = ? AND ts >= ? AND ts <= ?')
+        .get(probeId, fromMs, toMs).c;
+      if (total <= maxPoints) {
+        const rows = prep(`
+          SELECT ts, ok, latency_ms AS latencyMs, error FROM probe_results
+          WHERE probe_id = ? AND ts >= ? AND ts <= ? ORDER BY ts
+        `).all(probeId, fromMs, toMs);
+        return { points: rows, downsampled: false };
+      }
+      // node:sqlite ignores AS aliases on aggregates — address values positionally.
+      const bucketMs = (toMs - fromMs) / maxPoints;
+      const rows = prep(`
+        SELECT CAST((ts - ?) / ? AS INT) AS b,
+               avg(ok) AS a0, avg(latency_ms) AS a1
+        FROM probe_results
+        WHERE probe_id = ? AND ts >= ? AND ts <= ?
+        GROUP BY b ORDER BY b
+      `).all(fromMs, bucketMs, probeId, fromMs, toMs);
+      const points = rows.map((row) => ({
+        ts: fromMs + row.b * bucketMs,
+        okRatio: row.a0,
+        latencyMs: row.a1,
+      }));
+      return { points, downsampled: true };
+    },
+
+    pruneProbeResults(cutoffMs) {
+      return prep('DELETE FROM probe_results WHERE ts < ?').run(cutoffMs).changes;
+    },
+
+    // ---- uptime (v1.1) ----
+
+    getUptimePct(serverId, fromMs, toMs, intervalSec) {
+      const row = prep('SELECT COUNT(*) AS c FROM metrics WHERE server_id = ? AND ts >= ? AND ts <= ?')
+        .get(serverId, fromMs, toMs);
+      const expected = Math.max(1, Math.floor((toMs - fromMs) / 1000 / Math.max(1, intervalSec)));
+      return Math.min(100, Math.round((row.c / expected) * 1000) / 10);
+    },
+
+    getUptimeAll(fromMs, toMs) {
+      const rows = prep(`
+        SELECT m.server_id AS serverId, COUNT(*) AS c, s.interval_sec AS intervalSec
+        FROM metrics m JOIN servers s ON s.id = m.server_id
+        WHERE m.ts >= ? AND m.ts <= ?
+        GROUP BY m.server_id
+      `).all(fromMs, toMs);
+      const map = new Map();
+      for (const row of rows) {
+        const expected = Math.max(1, Math.floor((toMs - fromMs) / 1000 / Math.max(1, row.intervalSec)));
+        map.set(row.serverId, Math.min(100, Math.round((row.c / expected) * 1000) / 10));
+      }
+      return map;
     },
 
     // ---- events ----
