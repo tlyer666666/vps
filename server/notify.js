@@ -1,12 +1,15 @@
 // Generic webhook notifier. Failures are logged and reported as `false` —
 // a dead webhook must never take down ingest or the alert engine.
+// webhookUrl may be a string or a getter (re-evaluated per call) so admin
+// settings can change it live.
 export function createNotifier({ webhookUrl, fetchImpl = fetch, timeoutMs = 5000 } = {}) {
   return async function notify(event, server) {
-    if (!webhookUrl) return true;
+    const url = typeof webhookUrl === 'function' ? webhookUrl() : webhookUrl;
+    if (!url) return true;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetchImpl(webhookUrl, {
+      const res = await fetchImpl(url, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',

@@ -1,0 +1,429 @@
+// HTTP server: routes, sessions, SSE, rate limits, static files.
+import { createServer } from 'node:http';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { validateReport, normalize } from './ingest.js';
+import { verifyPassword, verifyAgentToken } from './auth.js';
+import { createNotifier } from './notify.js';
+import { serveStatic } from './static.js';
+import { deepMerge, CONFIG_DEFAULTS } from './config.js';
+
+const COOKIE_NAME = 'vw_session';
+const BODY_LIMIT = 64 * 1024;
+const RANGES = {
+  '1h': 3600e3,
+  '6h': 6 * 3600e3,
+  '24h': 24 * 3600e3,
+  '7d': 7 * 24 * 3600e3,
+  '30d': 30 * 24 * 3600e3,
+};
+const LOGIN_WINDOW_MS = 15 * 60_000;
+
+function json(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let size = 0;
+    const chunks = [];
+    let over = false;
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      resolve(result);
+    };
+    req.on('data', (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > BODY_LIMIT) {
+        over = true;
+        // Let the request drain so the 413 response can be delivered cleanly.
+        req.removeAllListeners('data');
+        req.resume();
+        finish({ over: true });
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => finish({ over: false, raw: Buffer.concat(chunks).toString('utf8') }));
+    req.on('error', () => finish({ over: false, raw: '' }));
+  });
+}
+
+function bearerOf(req) {
+  const h = req.headers.authorization ?? '';
+  return h.startsWith('Bearer ') ? h.slice(7) : null;
+}
+
+function sessionTokenOf(req) {
+  const cookie = req.headers.cookie ?? '';
+  for (const part of cookie.split(';')) {
+    const [k, ...rest] = part.trim().split('=');
+    if (k === COOKIE_NAME) return rest.join('=');
+  }
+  return null;
+}
+
+export function createApp({ config, store, engine = null, notifier = null, log = console }) {
+  const webDir = config.webDir ?? join(dirname(fileURLToPath(import.meta.url)), 'web');
+
+  // Effective settings = shipped defaults, overlaid with config and persisted admin changes.
+  let effective = deepMerge(
+    {
+      webhookUrl: CONFIG_DEFAULTS.webhookUrl,
+      thresholds: { ...CONFIG_DEFAULTS.thresholds },
+      notifyCooldownMin: CONFIG_DEFAULTS.notifyCooldownMin,
+      retentionDays: CONFIG_DEFAULTS.retentionDays,
+    },
+    {
+      webhookUrl: config.webhookUrl,
+      thresholds: config.thresholds,
+      notifyCooldownMin: config.notifyCooldownMin,
+      retentionDays: config.retentionDays,
+    },
+  );
+  effective = deepMerge(effective, store.getSetting('settings', {}) ?? {});
+  if (engine) {
+    engine.thresholds = { ...effective.thresholds };
+    engine.cooldownMs = effective.notifyCooldownMin * 60_000;
+  }
+
+  const notify = notifier ?? createNotifier({ webhookUrl: () => effective.webhookUrl });
+
+  const agentBuckets = new Map(); // ip -> { tokens, last }
+  const loginFails = new Map(); // ip -> [ms]
+  const sseClients = new Set(); // res objects
+  const sseHeartbeats = new Set(); // per-client heartbeat timers
+  let broadcastTimer = null;
+  let broadcastQueued = false;
+  let tickTimer = null;
+  let pruneTimer = null;
+
+  function buildOverview(now = Date.now()) {
+    const latest = store.latestPerServer();
+    return store.listServers().map((s) => {
+      const m = latest.get(s.id) ?? null;
+      const intervalSec = s.intervalSec ?? config.intervalSec ?? 10;
+      const windowMs = Math.max(intervalSec * 3 * 1000, 60_000);
+      const online = m !== null && now - m.ts <= windowMs;
+      const metric = m
+        ? {
+          ...m,
+          memPct: m.memTotal > 0 ? Math.round((m.memUsed / m.memTotal) * 10000) / 100 : null,
+          diskPct: m.diskTotal > 0 ? Math.round((m.diskUsed / m.diskTotal) * 10000) / 100 : null,
+        }
+        : null;
+      return { ...s, online, lastSeen: m ? m.ts : null, metric };
+    });
+  }
+
+  function sendSnapshot() {
+    const frame = `event: overview\ndata: ${JSON.stringify(buildOverview())}\n\n`;
+    for (const res of sseClients) {
+      try { res.write(frame); } catch { /* client vanished mid-write */ }
+    }
+  }
+
+  function broadcast() {
+    if (broadcastTimer) {
+      broadcastQueued = true;
+      return;
+    }
+    sendSnapshot();
+    broadcastTimer = setTimeout(() => {
+      broadcastTimer = null;
+      if (broadcastQueued) {
+        broadcastQueued = false;
+        broadcast();
+      }
+    }, 2000);
+  }
+
+  function consumeAgentRate(ip) {
+    const rate = config.rate?.agentPerSec ?? 30;
+    const now = Date.now();
+    const bucket = agentBuckets.get(ip) ?? { tokens: rate, last: now };
+    bucket.tokens = Math.min(rate, bucket.tokens + ((now - bucket.last) / 1000) * rate);
+    bucket.last = now;
+    if (bucket.tokens < 1) {
+      agentBuckets.set(ip, bucket);
+      return false;
+    }
+    bucket.tokens -= 1;
+    agentBuckets.set(ip, bucket);
+    return true;
+  }
+
+  function loginBlocked(ip) {
+    const limit = config.rate?.loginPer15Min ?? 5;
+    const now = Date.now();
+    const fails = (loginFails.get(ip) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
+    loginFails.set(ip, fails);
+    return fails.length >= limit;
+  }
+
+  function recordLoginFail(ip) {
+    const fails = loginFails.get(ip) ?? [];
+    fails.push(Date.now());
+    loginFails.set(ip, fails);
+  }
+
+  function isAuthed(req) {
+    const token = sessionTokenOf(req);
+    if (!token) return false;
+    return store.getSession(token) !== null;
+  }
+
+  async function handleLogin(req, res, ip) {
+    if (loginBlocked(ip)) return json(res, 429, { error: 'too many attempts' });
+    const { raw } = await readBody(req);
+    let body = {};
+    try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+    const stored = store.getAdminPasswordHash();
+    const ok = stored !== null && (await verifyPassword(String(body.password ?? ''), stored));
+    if (!ok) {
+      recordLoginFail(ip);
+      return json(res, 401, { error: 'unauthorized' });
+    }
+    loginFails.delete(ip);
+    const ttlMs = (config.sessionTtlDays ?? 7) * 24 * 3600 * 1000;
+    const token = store.createSession(ttlMs);
+    res.setHeader('set-cookie',
+      `${COOKIE_NAME}=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(ttlMs / 1000)}`);
+    return json(res, 200, { ok: true });
+  }
+
+  async function handleReport(req, res, ip) {
+    if (!consumeAgentRate(ip)) return json(res, 429, { error: 'rate limited' });
+    const server = verifyAgentToken(store, bearerOf(req));
+    if (!server) return json(res, 401, { error: 'unauthorized' });
+
+    const { over, raw } = await readBody(req);
+    if (over) return json(res, 413, { error: 'body too large' });
+    let body;
+    try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid json' }); }
+
+    const v = validateReport(body);
+    if (!v.ok) return json(res, 400, { error: v.error });
+
+    const now = Date.now();
+    const prev = store.latestPerServer().get(server.id) ?? null;
+    const dtSec = prev ? Math.max(0, (now - prev.ts) / 1000) : 0;
+    const metric = normalize(v.value, { prevCounter: prev, nowMs: now, dtSec });
+
+    let persisted = true;
+    try {
+      store.insertMetric(server.id, metric);
+    } catch (err) {
+      persisted = false;
+      log.warn(`[ingest] persist failed for server ${server.id}: ${err.message}`);
+    }
+    try {
+      engine?.ingest(server, metric, now);
+    } catch (err) {
+      log.warn(`[ingest] alert engine failed for server ${server.id}: ${err.message}`);
+    }
+    broadcast();
+    return json(res, 200, persisted ? { ok: true } : { ok: true, persisted: false });
+  }
+
+  function handleStream(req, res) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+    });
+    sseClients.add(res);
+    res.write(`event: overview\ndata: ${JSON.stringify(buildOverview())}\n\n`);
+    const heartbeat = setInterval(() => {
+      try { res.write(': ping\n\n'); } catch { /* ignored */ }
+    }, 15000);
+    sseHeartbeats.add(heartbeat);
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      sseHeartbeats.delete(heartbeat);
+      sseClients.delete(res);
+    });
+  }
+
+  function settingsView() {
+    return {
+      webhookUrl: effective.webhookUrl,
+      thresholds: { ...effective.thresholds },
+      notifyCooldownMin: effective.notifyCooldownMin,
+      retentionDays: effective.retentionDays,
+    };
+  }
+
+  function applySettings(patch) {
+    const saved = deepMerge(store.getSetting('settings', {}) ?? {}, patch);
+    store.setSetting('settings', saved);
+    effective = deepMerge(effective, patch);
+    if (engine) {
+      engine.thresholds = { ...effective.thresholds };
+      engine.cooldownMs = effective.notifyCooldownMin * 60_000;
+    }
+  }
+
+  const server = createServer(async (req, res) => {
+    const ip = req.socket.remoteAddress ?? '?';
+    const url = new URL(req.url, 'http://localhost');
+    const path = url.pathname;
+    try {
+      if (req.method === 'POST' && path === '/api/agent/report') {
+        return await handleReport(req, res, ip);
+      }
+      if (req.method === 'POST' && path === '/api/login') {
+        return await handleLogin(req, res, ip);
+      }
+      if (!path.startsWith('/api/')) {
+        if (req.method === 'GET' && serveStatic(webDir, path, res)) return;
+        if (req.method === 'GET') {
+          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+          return res.end('not found');
+        }
+        return json(res, 405, { error: 'method not allowed' });
+      }
+      if (!isAuthed(req)) return json(res, 401, { error: 'unauthorized' });
+
+      if (req.method === 'GET' && path === '/api/overview') {
+        return json(res, 200, buildOverview());
+      }
+      if (req.method === 'GET' && path === '/api/stream') {
+        return handleStream(req, res);
+      }
+      if (req.method === 'GET' && path === '/api/events') {
+        const limit = Math.min(Number(url.searchParams.get('limit')) || 100, 1000);
+        const serverId = url.searchParams.get('server_id');
+        return json(res, 200, store.listEvents({
+          limit,
+          serverId: serverId === null ? null : Number(serverId),
+        }));
+      }
+      const historyMatch = path.match(/^\/api\/servers\/(\d+)\/history$/);
+      if (req.method === 'GET' && historyMatch) {
+        const range = url.searchParams.get('range') ?? '24h';
+        const span = RANGES[range];
+        if (!span) return json(res, 400, { error: 'range must be one of ' + Object.keys(RANGES).join('|') });
+        const now = Date.now();
+        return json(res, 200, {
+          range,
+          ...store.getHistory(Number(historyMatch[1]), now - span, now),
+        });
+      }
+      if (req.method === 'POST' && path === '/api/logout') {
+        const token = sessionTokenOf(req);
+        if (token) store.deleteSession(token);
+        res.setHeader('set-cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
+        return json(res, 200, { ok: true });
+      }
+
+      if (path === '/api/admin/servers' && req.method === 'POST') {
+        const { raw } = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+        if (typeof body.name !== 'string' || body.name.trim() === '') {
+          return json(res, 400, { error: 'name is required' });
+        }
+        const created = store.createServer(body);
+        broadcast();
+        return json(res, 200, created);
+      }
+      const idMatch = path.match(/^\/api\/admin\/servers\/(\d+)(\/reset-token)?$/);
+      if (idMatch) {
+        const id = Number(idMatch[1]);
+        if (!store.getServer(id)) return json(res, 404, { error: 'no such server' });
+        if (req.method === 'POST' && idMatch[2]) {
+          return json(res, 200, { id, token: store.resetToken(id) });
+        }
+        if (req.method === 'PATCH' && !idMatch[2]) {
+          const { raw } = await readBody(req);
+          let body = {};
+          try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+          store.updateServer(id, body);
+          broadcast();
+          return json(res, 200, { ok: true });
+        }
+        if (req.method === 'DELETE' && !idMatch[2]) {
+          store.deleteServer(id);
+          broadcast();
+          return json(res, 200, { ok: true });
+        }
+      }
+      if (path === '/api/admin/settings') {
+        if (req.method === 'GET') return json(res, 200, settingsView());
+        if (req.method === 'PUT') {
+          const { raw } = await readBody(req);
+          let body = {};
+          try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+          applySettings(body);
+          return json(res, 200, settingsView());
+        }
+      }
+      return json(res, 404, { error: 'not found' });
+    } catch (err) {
+      log.error(`[http] ${req.method} ${path}: ${err.stack ?? err}`);
+      if (!res.headersSent) json(res, 500, { error: 'internal error' });
+      else res.end();
+    }
+  });
+
+  server.app = {
+    buildOverview,
+    broadcast,
+    boot() {
+      tickTimer = setInterval(() => {
+        try {
+          engine?.tick();
+          broadcast();
+        } catch (err) {
+          log.error(`[tick] ${err.stack ?? err}`);
+        }
+      }, 30_000);
+      tickTimer.unref?.();
+      pruneTimer = setInterval(() => {
+        try {
+          const cutoff = Date.now() - effective.retentionDays * 24 * 3600 * 1000;
+          const removed = store.pruneOlderThan(cutoff);
+          if (removed > 0) log.info(`[prune] removed ${removed} stale metric rows`);
+        } catch (err) {
+          log.error(`[prune] ${err.stack ?? err}`);
+        }
+      }, 6 * 3600 * 1000);
+      pruneTimer.unref?.();
+      try {
+        engine?.tick();
+      } catch (err) {
+        log.error(`[tick] ${err.stack ?? err}`);
+      }
+    },
+    close() {
+      clearInterval(tickTimer);
+      clearInterval(pruneTimer);
+      clearTimeout(broadcastTimer);
+      for (const hb of sseHeartbeats) clearInterval(hb);
+      sseHeartbeats.clear();
+      for (const res of sseClients) {
+        try { res.end(); } catch { /* ignored */ }
+      }
+      sseClients.clear();
+    },
+  };
+  const nativeClose = server.close.bind(server);
+  server.close = (cb) => {
+    server.app.close();
+    // SSE keep-alive sockets would otherwise keep close() pending forever.
+    server.closeAllConnections?.();
+    return nativeClose(cb);
+  };
+  server.boot = server.app.boot;
+
+  return server;
+}

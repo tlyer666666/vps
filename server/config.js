@@ -21,6 +21,8 @@ const DEFAULTS = {
   rate: { agentPerSec: 30, loginPer15Min: 5 },
 };
 
+export const CONFIG_DEFAULTS = DEFAULTS;
+
 const CLI_KEYS = new Map([
   ['port', 'port'],
   ['host', 'host'],
@@ -34,13 +36,14 @@ const CLI_KEYS = new Map([
   ['interval', 'intervalSec'],
 ]);
 
-function isPlainObject(v) {
+export function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
-function deepMerge(base, patch) {
+export function deepMerge(base, patch) {
   const out = { ...base };
   for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) continue;
     out[k] = isPlainObject(v) && isPlainObject(out[k]) ? deepMerge(out[k], v) : v;
   }
   return out;
