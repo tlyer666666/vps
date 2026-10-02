@@ -1,0 +1,14 @@
+{
+  "name": "vpswatch",
+  "version": "1.0.0",
+  "description": "多 VPS 日常监控管理系统:零依赖 Node.js Hub + bash Agent",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server/main.js",
+    "test": "node --test tests/"
+  }
+}
