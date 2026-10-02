@@ -174,3 +174,12 @@ test('a fresh engine (hub restart) does not re-notify an already-open event', ()
   assert.equal(notified.filter((t) => t === 'cpu').length, 1, 'open event reused: no duplicate webhook');
   store.close();
 });
+
+test('forget drops per-server memory when a server is deleted (iteration 2)', () => {
+  const { store, engine, server } = setup();
+  engine.ingest(server, metric(1000), 1000);
+  assert.ok(engine.state(server.id));
+  engine.forget(server.id);
+  assert.equal(engine.state(server.id), null);
+  store.close();
+});

@@ -42,34 +42,29 @@ die_config() {
 # ---- collectors ------------------------------------------------------------
 
 read_cpu_counters() { # sets CPU_TOTAL CPU_IDLE from the aggregate "cpu" line
-  local line
-  line=$(head -n 1 "$PROC/stat" 2>/dev/null) || return 1
-  # fields: user nice system idle iowait irq softirq steal guest guest_nice
-  local total idle iowait
-  total=$(echo "$line" | awk '{s=0; for (i=2; i<=NF; i++) s+=$i; print s}')
-  idle=$(echo "$line" | awk '{print $5}')
-  iowait=$(echo "$line" | awk '{print $6}')
-  CPU_TOTAL="$total"
-  CPU_IDLE=$(( idle + iowait ))
+  [ -r "$PROC/stat" ] || return 1
+  # one awk pass: total = sum of all fields, idle = idle + iowait
+  read -r CPU_TOTAL CPU_IDLE <<< "$(awk 'NR==1 { t=0; for (i=2; i<=NF; i++) t+=$i; print t, $5+$6 }' "$PROC/stat" 2>/dev/null)"
+  [ -n "$CPU_TOTAL" ] || return 1
 }
 
 read_mem() { # sets MEM_TOTAL MEM_USED SWAP_TOTAL SWAP_USED (bytes)
-  local mt av st sf
-  mt=$(awk '/^MemTotal:/ {print $2}' "$PROC/meminfo" 2>/dev/null)
-  av=$(awk '/^MemAvailable:/ {print $2}' "$PROC/meminfo" 2>/dev/null)
-  st=$(awk '/^SwapTotal:/ {print $2}' "$PROC/meminfo" 2>/dev/null)
-  sf=$(awk '/^SwapFree:/ {print $2}' "$PROC/meminfo" 2>/dev/null)
-  [ -z "$mt" ] && { MEM_TOTAL=""; return; }
+  [ -r "$PROC/meminfo" ] || { MEM_TOTAL=""; return; }
+  # one awk pass; MemAvailable falls back to Free+Buffers+Cached in-kernel-style
+  read -r mt av st sf <<< "$(awk '
+    /^MemTotal:/      { mt = $2 }
+    /^MemAvailable:/  { av = $2; avf = 1 }
+    /^MemFree:/       { fr = $2 }
+    /^Buffers:/       { buf = $2 }
+    /^Cached:/        { cch = $2 }
+    /^SwapTotal:/     { st = $2 }
+    /^SwapFree:/      { sf = $2 }
+    END { if (!avf) av = fr + buf + cch; print mt + 0, av + 0, st + 0, sf + 0 }
+  ' "$PROC/meminfo" 2>/dev/null)"
+  [ -n "$mt" ] && [ "$mt" -gt 0 ] 2>/dev/null || { MEM_TOTAL=""; return; }
   MEM_TOTAL=$(( mt * 1024 ))
-  if [ -z "$av" ]; then
-    local fr buf cach
-    fr=$(awk '/^MemFree:/ {print $2}' "$PROC/meminfo")
-    buf=$(awk '/^Buffers:/ {print $2}' "$PROC/meminfo")
-    cach=$(awk '/^Cached:/ {print $2}' "$PROC/meminfo")
-    av=$(( fr + buf + cach ))
-  fi
   MEM_USED=$(( (mt - av) * 1024 ))
-  if [ -n "$st" ]; then
+  if [ "$st" -gt 0 ] 2>/dev/null; then
     SWAP_TOTAL=$(( st * 1024 ))
     SWAP_USED=$(( (st - sf) * 1024 ))
   else
@@ -77,36 +72,28 @@ read_mem() { # sets MEM_TOTAL MEM_USED SWAP_TOTAL SWAP_USED (bytes)
   fi
 }
 
-read_load() { # LOAD1 LOAD5 LOAD15
-  local line
-  line=$(head -n 1 "$PROC/loadavg" 2>/dev/null) || { LOAD1=""; return; }
-  LOAD1=$(echo "$line" | cut -d' ' -f1)
-  LOAD5=$(echo "$line" | cut -d' ' -f2)
-  LOAD15=$(echo "$line" | cut -d' ' -f3)
+read_load() { # LOAD1 LOAD5 LOAD15 — pure bash, no subprocesses
+  [ -r "$PROC/loadavg" ] || { LOAD1=""; return; }
+  read -r LOAD1 LOAD5 LOAD15 _ < "$PROC/loadavg"
 }
 
 read_uptime() { # UPTIME seconds
   UPTIME=$(cut -d' ' -f1 "$PROC/uptime" 2>/dev/null)
 }
 
-read_net() { # sums non-lo interfaces; sets NET_RX NET_TX (bytes)
-  local rx=0 tx=0 iface line rxv txv
+read_net() { # sums non-lo interfaces; sets NET_RX NET_TX (bytes) — one awk pass
+  local rx=0 tx=0
   if [ -r "$PROC/net/dev" ]; then
-    while IFS= read -r line; do
-      case "$line" in
-        *'|'*) continue ;;                     # header
-      esac
-      iface="${line%%:*}"
-      iface=$(echo "$iface" | tr -d ' ')
-      [ "$iface" = "lo" ] && continue
-      line="${line#*:}"
-      rxv=$(echo "$line" | awk '{print $1}')
-      txv=$(echo "$line" | awk '{print $9}')
-      case "$rxv" in (*[!0-9]*|'') continue ;; esac
-      case "$txv" in (*[!0-9]*|'') continue ;; esac
-      rx=$(( rx + rxv ))
-      tx=$(( tx + txv ))
-    done < "$PROC/net/dev"
+    read -r rx tx <<< "$(awk -F: '
+      NF > 1 {
+        n = $1; gsub(/ /, "", n)
+        if (n != "lo") {
+          split($2, a, " ")
+          if (a[1] ~ /^[0-9]+$/ && a[9] ~ /^[0-9]+$/) { rx += a[1]; tx += a[9] }
+        }
+      }
+      END { print rx + 0, tx + 0 }
+    ' "$PROC/net/dev" 2>/dev/null)"
   fi
   NET_RX="$rx"
   NET_TX="$tx"
@@ -139,10 +126,10 @@ read_disks() { # builds DISKS_JSON for / and $MOUNTS
   for m in / $MOUNTS; do
     line=$("$DF_CMD" -kP "$m" 2>/dev/null | tail -n 1)
     [ -z "$line" ] && continue
-    size=$(echo "$line" | awk '{print $2 * 1024}')
-    used=$(echo "$line" | awk '{print $3 * 1024}')
+    read -r _ size used _ <<< "$line"
     case "$size" in (*[!0-9]*|'') continue ;; esac
-    parts="$parts{\"mount\":\"$m\",\"total\":$size,\"used\":$used},"
+    case "$used" in (*[!0-9]*|'') continue ;; esac
+    parts="$parts{\"mount\":\"$m\",\"total\":$((size * 1024)),\"used\":$((used * 1024))},"
   done
   parts="${parts%,}"
   DISKS_JSON="[$parts]"
@@ -199,13 +186,6 @@ EOF
   mv -f "$tmp" "$STATE_FILE"
 }
 
-delta_guard() { # prints delta or 0 on counter rollback/first sample
-  local prev="$1" cur="$2"
-  if [ -z "$prev" ]; then echo 0; return; fi
-  if [ "$cur" -lt "$prev" ]; then echo 0; return; fi
-  echo $(( cur - prev ))
-}
-
 # ---- sampling and payload --------------------------------------------------
 
 sample() {
@@ -231,7 +211,7 @@ sample() {
   read_disks
 
   TODAY=$("$DATE_CMD" +%Y%m%d)
-  MONTH=$("$DATE_CMD" +%Y%m)
+  MONTH="${TODAY:0:6}"   # same clock, no second date subprocess
 
   load_state
 
@@ -243,13 +223,17 @@ sample() {
     CPU_PCT="0.0"
   fi
 
-  # traffic ledger
+  # traffic ledger — delta computed inline (no subshell forks)
   if [ "$day" != "$TODAY" ]; then daily_rx=0; daily_tx=0; fi
   if [ "$month" != "$MONTH" ]; then monthly_rx=0; monthly_tx=0; fi
-  daily_rx=$(( daily_rx + $(delta_guard "$prev_rx" "$NET_RX") ))
-  daily_tx=$(( daily_tx + $(delta_guard "$prev_tx" "$NET_TX") ))
-  monthly_rx=$(( monthly_rx + $(delta_guard "$prev_rx" "$NET_RX") ))
-  monthly_tx=$(( monthly_tx + $(delta_guard "$prev_tx" "$NET_TX") ))
+  delta=0
+  if [ -n "$prev_rx" ] && [ "$NET_RX" -ge "$prev_rx" ]; then delta=$(( NET_RX - prev_rx )); fi
+  daily_rx=$(( daily_rx + delta ))
+  monthly_rx=$(( monthly_rx + delta ))
+  delta=0
+  if [ -n "$prev_tx" ] && [ "$NET_TX" -ge "$prev_tx" ]; then delta=$(( NET_TX - prev_tx )); fi
+  daily_tx=$(( daily_tx + delta ))
+  monthly_tx=$(( monthly_tx + delta ))
 
   save_state
 }

@@ -17,6 +17,10 @@ export class AlertEngine {
     return this.states.get(serverId) ?? null;
   }
 
+  forget(serverId) {
+    this.states.delete(serverId);
+  }
+
   #stateFor(serverId, intervalSec) {
     let st = this.states.get(serverId);
     if (!st) {

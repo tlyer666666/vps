@@ -121,7 +121,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
   let pruneTimer = null;
 
   function buildOverview(now = Date.now()) {
-    const latest = store.latestPerServer();
+    const latest = store.latestCached();
     return store.listServers().map((s) => {
       const m = latest.get(s.id) ?? null;
       const intervalSec = s.intervalSec ?? config.intervalSec ?? 10;
@@ -229,7 +229,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     if (!v.ok) return json(res, 400, { error: v.error });
 
     const now = Date.now();
-    const prev = store.latestPerServer().get(server.id) ?? null;
+    const prev = store.latestCached().get(server.id) ?? null;
     const dtSec = prev ? Math.max(0, (now - prev.ts) / 1000) : 0;
     const metric = normalize(v.value, { prevCounter: prev, nowMs: now, dtSec });
 
@@ -450,6 +450,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         }
         if (req.method === 'DELETE' && !idMatch[2]) {
           store.deleteServer(id);
+          engine?.forget?.(id);
           broadcast();
           return json(res, 200, { ok: true });
         }
