@@ -331,3 +331,101 @@ test('admin can update and delete a server', async () => {
   assert.deepEqual(await (await h.call('/api/overview')).json(), []);
   h.close();
 });
+
+test('admin password change rotates the credential (review finding 1)', async () => {
+  const h = await startApp();
+  await login(h);
+  const res = await h.call('/api/admin/password', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'brand-new-pw' }),
+  });
+  assert.equal(res.status, 200);
+
+  // same store: the old password must stop working, the new one must log in
+  await h.call('/api/logout', { method: 'POST' });
+  const oldTry = await h.call('/api/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  assert.equal(oldTry.status, 401, 'old password must stop working');
+  const newTry = await h.call('/api/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'brand-new-pw' }),
+  });
+  assert.equal(newTry.status, 200, 'new password must log in');
+  h.close();
+});
+
+test('password change rejects short or missing passwords', async () => {
+  const h = await startApp();
+  await login(h);
+  const short = await h.call('/api/admin/password', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'short' }),
+  });
+  assert.equal(short.status, 400);
+  h.close();
+});
+
+test('trust-proxy takes client IP from X-Forwarded-For (review finding 3)', async () => {
+  const store = openStore(':memory:');
+  store.setAdminPasswordHash(await hashPassword(PASSWORD));
+  const engine = new AlertEngine(store, {
+    thresholds: { cpu: 90, mem: 90, disk: 90, consecutive: 3, expiryDays: 7 },
+  });
+  const app = createApp({
+    config: { trustProxy: true, rate: { agentPerSec: 30, loginPer15Min: 2 } },
+    store, engine,
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise((r) => server.once('listening', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const attempt = (xff) => fetch(`${base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': xff },
+    body: JSON.stringify({ password: 'nope' }),
+  }).then((r) => r.status);
+
+  assert.equal(await attempt('10.0.0.1'), 401);
+  assert.equal(await attempt('10.0.0.1'), 401);
+  assert.equal(await attempt('10.0.0.1'), 429, 'third failure from same XFF ip is limited');
+  assert.equal(await attempt('10.0.0.2'), 401, 'different XFF ip has its own bucket');
+  await new Promise((r) => { server.close(r); server.closeAllConnections(); });
+});
+
+test('without trust-proxy the XFF header is ignored (spoof-safe default)', async () => {
+  const h = await startApp();
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch(`${h.base}/api/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-forwarded-for': `10.9.9.${i}` },
+      body: JSON.stringify({ password: 'nope' }),
+    });
+    assert.equal(res.status, 401);
+  }
+  const res = await fetch(`${h.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-for': '10.9.9.99' },
+    body: JSON.stringify({ password: 'nope' }),
+  });
+  assert.equal(res.status, 429, 'all requests share the socket-IP bucket by default');
+  h.close();
+});
+
+test('session cookie gains Secure flag when HTTPS is detected (review finding 4)', async () => {
+  const h = await startApp();
+  const res = await fetch(`${h.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  assert.equal(res.status, 200);
+  const setCookie = res.headers.get('set-cookie');
+  assert.match(setCookie, /Secure/i, 'login over detected HTTPS must set Secure');
+  h.close();
+});

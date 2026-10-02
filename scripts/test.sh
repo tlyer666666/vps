@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 rc=0
 
 echo "== node unit tests =="
-node --test || rc=1
+node --test --test-force-exit || rc=1
 
 echo "== agent tests =="
 bash tests/agent/agent_test.sh || rc=1

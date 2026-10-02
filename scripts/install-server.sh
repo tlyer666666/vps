@@ -12,6 +12,7 @@ usage() {
 
 PORT="3577"
 PASSWORD=""
+TRUST_PROXY="false"
 NO_START=0
 MODE="install"
 
@@ -19,6 +20,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:-3577}"; shift 2 ;;
     --password) PASSWORD="${2:-}"; shift 2 ;;
+    --trust-proxy) TRUST_PROXY="true"; shift ;;
     --no-start) NO_START=1; shift ;;
     --print-unit) MODE="print-unit"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -71,6 +73,9 @@ fi
 echo "installing vpswatch hub..."
 mkdir -p "$APP_DIR" "$(dirname "$CONF")" "${PREFIX}/var/lib/vpswatch"
 cp -R "$SRC_DIR" "$APP_DIR/server"
+# The hub serves /install-agent.sh and /agent.sh from these trees — without
+# them the panel's copy-paste agent one-liner 404s in the installed layout.
+cp -R "$SCRIPT_DIR/../scripts" "$SCRIPT_DIR/../agent" "$APP_DIR/"
 
 GENERATED=""
 if [ -z "$PASSWORD" ]; then
@@ -81,6 +86,7 @@ fi
 cat > "$CONF" <<EOF
 VPSWATCH_PORT="$PORT"
 VPSWATCH_ADMIN_PASSWORD="$PASSWORD"
+VPSWATCH_TRUST_PROXY=$TRUST_PROXY
 EOF
 chmod 600 "$CONF"
 

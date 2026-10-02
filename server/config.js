@@ -17,6 +17,7 @@ const DEFAULTS = {
   webhookUrl: '',
   notifyCooldownMin: 10,
   adminPassword: null,
+  trustProxy: false, // take client IP from the last X-Forwarded-For hop (set when behind a reverse proxy)
   thresholds: { cpu: 90, mem: 90, disk: 90, consecutive: 3, expiryDays: 7 },
   rate: { agentPerSec: 30, loginPer15Min: 5 },
 };
@@ -33,6 +34,7 @@ const CLI_KEYS = new Map([
   ['webhook-url', 'webhookUrl'],
   ['notify-cooldown-min', 'notifyCooldownMin'],
   ['admin-password', 'adminPassword'],
+  ['trust-proxy', 'trustProxy'],
   ['interval', 'intervalSec'],
 ]);
 
@@ -99,6 +101,9 @@ function argLayer(args) {
   const out = { ...args };
   for (const k of ['port', 'retentionDays', 'sessionTtlDays', 'intervalSec', 'notifyCooldownMin']) {
     if (k in out) out[k] = coerceNum(out[k]);
+  }
+  if (typeof out.trustProxy === 'string') {
+    out.trustProxy = out.trustProxy === 'true' || out.trustProxy === '1';
   }
   return out;
 }

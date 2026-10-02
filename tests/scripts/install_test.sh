@@ -35,6 +35,12 @@ code=$?
 err=$(bash scripts/install-server.sh --no-such-flag 2>&1 >/dev/null)
 [ $? -ne 0 ] && ok "unknown flag rejected (server)" || fail "unknown flag" "exit 0"
 
+# ---- 3b. server install with temp PREFIX copies scripts + agent trees (review finding 2)
+PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12345 --password dummy123 --no-start >/dev/null 2>&1
+[ -f "$TMP/root2/opt/vpswatch/server/main.js" ] && ok "server tree installed" || fail "server tree" "missing"
+[ -f "$TMP/root2/opt/vpswatch/scripts/install-agent.sh" ] && ok "scripts tree installed" || fail "scripts tree" "missing"
+[ -f "$TMP/root2/opt/vpswatch/agent/vpswatch-agent.sh" ] && ok "agent tree installed" || fail "agent tree" "missing"
+
 # ---- 4. agent install with temp PREFIX (no systemd, no start) --------------
 PREFIX="$TMP/root" bash scripts/install-agent.sh \
   --server http://hub.example:3577 --token tok123 --interval 15 --no-start >/dev/null 2>&1

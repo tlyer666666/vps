@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validateReport, normalize } from './ingest.js';
-import { verifyPassword, verifyAgentToken } from './auth.js';
+import { verifyPassword, verifyAgentToken, hashPassword } from './auth.js';
 import { createNotifier } from './notify.js';
 import { serveStatic } from './static.js';
 import { deepMerge, CONFIG_DEFAULTS } from './config.js';
@@ -96,6 +96,20 @@ export function createApp({ config, store, engine = null, notifier = null, log =
   }
 
   const notify = notifier ?? createNotifier({ webhookUrl: () => effective.webhookUrl });
+
+  // Client identity for rate limits. Behind a reverse proxy every socket is
+  // 127.0.0.1, so all clients would share one bucket — trust-proxy opts into
+  // taking the client from the last X-Forwarded-For hop instead.
+  function clientIp(req) {
+    if (config.trustProxy) {
+      const xff = req.headers['x-forwarded-for'];
+      if (typeof xff === 'string' && xff.length > 0) {
+        const hops = xff.split(',').map((s) => s.trim()).filter(Boolean);
+        if (hops.length > 0) return hops[hops.length - 1];
+      }
+    }
+    return req.socket.remoteAddress ?? '?';
+  }
 
   const agentBuckets = new Map(); // ip -> { tokens, last }
   const loginFails = new Map(); // ip -> [ms]
@@ -195,8 +209,9 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     loginFails.delete(ip);
     const ttlMs = (config.sessionTtlDays ?? 7) * 24 * 3600 * 1000;
     const token = store.createSession(ttlMs);
+    const isHttps = req.socket.encrypted === true || req.headers['x-forwarded-proto'] === 'https';
     res.setHeader('set-cookie',
-      `${COOKIE_NAME}=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(ttlMs / 1000)}`);
+      `${COOKIE_NAME}=${token}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${Math.floor(ttlMs / 1000)}${isHttps ? '; Secure' : ''}`);
     return json(res, 200, { ok: true });
   }
 
@@ -273,7 +288,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
   }
 
   const server = createServer(async (req, res) => {
-    const ip = req.socket.remoteAddress ?? '?';
+    const ip = clientIp(req);
     const url = new URL(req.url, 'http://localhost');
     const path = url.pathname;
     try {
@@ -375,6 +390,15 @@ export function createApp({ config, store, engine = null, notifier = null, log =
           applySettings(body);
           return json(res, 200, settingsView());
         }
+      }
+      if (req.method === 'POST' && path === '/api/admin/password') {
+        const { raw } = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+        const pw = typeof body.password === 'string' ? body.password : '';
+        if (pw.length < 8) return json(res, 400, { error: 'password must be at least 8 characters' });
+        store.setAdminPasswordHash(await hashPassword(pw));
+        return json(res, 200, { ok: true });
       }
       return json(res, 404, { error: 'not found' });
     } catch (err) {
