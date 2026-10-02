@@ -3,10 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VPSWatch</title>
+  <title>VPSWatch — 多 VPS 监控面板</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <h1>VPSWatch</h1>
-  <p>面板资源尚未就绪(占位页面)。</p>
+  <header id="topbar">
+    <a class="brand" href="#/">⏱ VPSWatch</a>
+    <span id="online-count" class="dim"></span>
+    <span class="spacer"></span>
+    <button id="logout">退出</button>
+  </header>
+  <main id="main"></main>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>
