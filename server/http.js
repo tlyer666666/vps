@@ -473,14 +473,17 @@ export function createApp({ config, store, engine = null, notifier = null, probe
           };
         });
         const latestProbes = store.latestProbeResults();
+        const now24 = now - 24 * 3600 * 1000;
         const probes = store.listProbes().map((p) => {
           const l = latestProbes.get(p.id) ?? null;
+          const history = store.getProbeHistory(p.id, now24, now, 100);
           return {
             id: p.id, name: p.name, type: p.type, target: p.target,
             ok: l ? l.ok === 1 : null,
             latencyMs: l ? l.latencyMs : null,
             error: l ? l.error : null,
             ts: l ? l.ts : null,
+            history24h: history.points.map((pt) => ({ ts: pt.ts, latencyMs: pt.latencyMs ?? null })),
           };
         });
         return json(res, 200, { servers, probes });

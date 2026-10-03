@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   linePath, downsampleRender,
-  fmtBytes, fmtBytesPerSec, fmtUptime, fmtCountdown, fmtPct,
+  fmtBytes, fmtBytesPerSec, fmtUptime, fmtCountdown, fmtPct, fmtRel,
 } from '../server/web/charts.js';
 
 test('fmtBytes: 0/1023/1MiB/1.5GB/null/negative', () => {
@@ -45,6 +45,15 @@ test('fmtPct rounds to one decimal with % sign', () => {
   assert.equal(fmtPct(0), '0.0%');
   assert.equal(fmtPct(12.34), '12.3%');
   assert.equal(fmtPct(null), '—');
+});
+
+test('fmtRel renders relative report age (v1.2)', () => {
+  const now = 1_000_000_000;
+  assert.equal(fmtRel(now - 3_000, now), '3 秒前');
+  assert.equal(fmtRel(now - 5 * 60_000, now), '5 分钟前');
+  assert.equal(fmtRel(now - 2 * 3600_000, now), '2 小时前');
+  assert.equal(fmtRel(now - 3 * 86400_000, now), '3 天前');
+  assert.equal(fmtRel(null, now), '—');
 });
 
 test('linePath: empty and single point are safe', () => {

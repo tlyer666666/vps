@@ -8,7 +8,7 @@ import { hashPassword } from './auth.js';
 import { AlertEngine } from './alerts.js';
 import { createNotifier } from './notify.js';
 import { sendTelegram } from './telegram.js';
-import { createProbeRunner } from './probes.js';
+import { createProbeRunner, seedDefaultProbes } from './probes.js';
 import { createApp } from './http.js';
 
 const { config, generatedAdminPassword } = loadConfig();
@@ -57,6 +57,7 @@ const probeRunner = createProbeRunner(store, { onNotify: dispatch });
 
 const app = createApp({ config, store, engine, probeRunner, log: console });
 app.boot();
+seedDefaultProbes(store); // first boot: built-in dial-test presets
 probeRunner.start();
 app.listen(config.port, config.host, () => {
   console.log(`VPSWatch hub 已启动: http://${config.host}:${config.port} (数据: ${config.dbPath})`);

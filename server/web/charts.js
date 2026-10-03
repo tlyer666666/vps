@@ -52,6 +52,16 @@ export function fmtPct(p) {
   return `${p.toFixed(1)}%`;
 }
 
+// Relative age of a timestamp ("3 秒前"), for last-report indicators.
+export function fmtRel(msAgo, nowMs = Date.now()) {
+  if (typeof msAgo !== 'number' || !Number.isFinite(msAgo)) return '—';
+  const s = Math.max(0, Math.floor((nowMs - msAgo) / 1000));
+  if (s < 60) return s === 0 ? '刚刚' : `${s} 秒前`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+
 // points: [{x, y}] in value space; returns an SVG path `d` string.
 export function linePath(points, { w, h, pad = 2, min, max }) {
   if (!Array.isArray(points) || points.length === 0) return '';
