@@ -57,7 +57,7 @@ export function renderCards(servers, nowMs = Date.now()) {
           <span>负载 ${m.load1 != null ? Number(m.load1).toFixed(2) : '—'}</span>
         </div>
         <footer>
-          <span>运行 ${escapeHtml(fmtUptime(m.uptimeSec))}</span>
+          <span>在线率 ${s.uptimePct24h != null ? Number(s.uptimePct24h).toFixed(1) + '%' : '—'} · 运行 ${escapeHtml(fmtUptime(m.uptimeSec))}</span>
           <span>TCP ${m.tcpConns ?? '—'} · 进程 ${m.processes ?? '—'}</span>
         </footer>`
       : '<div class="nodata">暂无数据,等待上报…</div>';
@@ -89,8 +89,10 @@ if (typeof document !== 'undefined') {
   const state = {
     servers: [],
     sort: 'default',
+    groupFilter: '',
     es: null,
     pollTimer: null,
+    statusTimer: null,
     detail: { id: null, range: '24h', data: null },
   };
 
@@ -103,8 +105,11 @@ if (typeof document !== 'undefined') {
     return res;
   }
 
-  function sortedServers() {
-    const list = [...state.servers];
+  function filteredServers() {
+    let list = [...state.servers];
+    if (state.groupFilter) {
+      list = list.filter((s) => (s.groupName ?? '') === state.groupFilter);
+    }
     const by = {
       cpu: (a, b) => (b.metric?.cpuPct ?? -1) - (a.metric?.cpuPct ?? -1),
       mem: (a, b) => (b.metric?.memPct ?? -1) - (a.metric?.memPct ?? -1),
@@ -114,6 +119,11 @@ if (typeof document !== 'undefined') {
       default: (a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id,
     };
     return list.sort(by[state.sort] ?? by.default);
+  }
+
+  function groupOptions() {
+    const groups = [...new Set(state.servers.map((s) => s.groupName ?? '').filter(Boolean))];
+    return groups;
   }
 
   function renderTopbar() {
@@ -126,10 +136,11 @@ if (typeof document !== 'undefined') {
   function updateOverviewCards() {
     renderTopbar();
     const cards = document.getElementById('cards');
-    if (cards) cards.innerHTML = renderCards(sortedServers());
+    if (cards) cards.innerHTML = renderCards(filteredServers());
   }
 
   function renderOverview() {
+    const groups = groupOptions();
     $('#main').innerHTML = `
       <div class="toolbar">
         <label>排序
@@ -142,6 +153,13 @@ if (typeof document !== 'undefined') {
             <option value="name"${state.sort === 'name' ? ' selected' : ''}>名称</option>
           </select>
         </label>
+        ${groups.length ? `<label>分组
+          <select id="group-filter">
+            <option value="">全部分组</option>
+            ${groups.map((g) => `<option value="${escapeHtml(g)}"${state.groupFilter === g ? ' selected' : ''}>${escapeHtml(g)}</option>`).join('')}
+          </select>
+        </label>` : ''}
+        <a class="dim" href="#/status" style="align-self:center">状态页 ↗</a>
         <span class="spacer"></span>
         <button id="btn-alerts">告警记录</button>
         <button id="btn-admin">管理</button>
@@ -149,6 +167,7 @@ if (typeof document !== 'undefined') {
       </div>
       <div id="cards" class="grid"></div>`;
     $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; updateOverviewCards(); });
+    $('#group-filter')?.addEventListener('change', (e) => { state.groupFilter = e.target.value; updateOverviewCards(); });
     $('#btn-add').addEventListener('click', () => showServerForm(null));
     $('#btn-admin').addEventListener('click', () => { location.hash = '#/admin'; });
     $('#btn-alerts').addEventListener('click', showEvents);
@@ -181,6 +200,10 @@ if (typeof document !== 'undefined') {
           <label>地区<input name="region" value="${escapeHtml(s.region ?? '')}" placeholder="香港"></label>
           <label>月价格 (¥)<input name="priceCny" type="number" step="0.01" value="${s.priceCny ?? ''}"></label>
         </div>
+        <div class="row">
+          <label>分组<input name="groupName" value="${escapeHtml(s.groupName ?? '')}" placeholder="生产环境"></label>
+          <label>月流量配额 (GB)<input name="quotaGb" type="number" min="0" step="0.1" value="${s.monthlyQuotaBytes != null ? s.monthlyQuotaBytes / 1024 ** 3 : ''}" placeholder="不限"></label>
+        </div>
         <label>到期日<input name="expiresAt" type="date" value="${exp}"></label>
         <label>上报间隔 (秒)<input name="intervalSec" type="number" min="5" max="3600" value="${s.intervalSec ?? 10}"></label>
         <label>备注<textarea name="notes" rows="2">${escapeHtml(s.notes ?? '')}</textarea></label>
@@ -202,6 +225,10 @@ if (typeof document !== 'undefined') {
         expiresAt: fd.get('expiresAt') ? Date.parse(fd.get('expiresAt')) : null,
         intervalSec: Number(fd.get('intervalSec')) || 10,
         notes: String(fd.get('notes')),
+        groupName: String(fd.get('groupName') ?? '').trim(),
+        monthlyQuotaBytes: fd.get('quotaGb') === '' || fd.get('quotaGb') == null
+          ? null
+          : Math.round(Number(fd.get('quotaGb')) * 1024 ** 3),
       };
       const res = existing
         ? await api(`/api/admin/servers/${existing.id}`, { method: 'PATCH', body: JSON.stringify(body) })
@@ -270,6 +297,12 @@ if (typeof document !== 'undefined') {
         <thead><tr><th>名称</th><th>服务商</th><th>到期</th><th>月费</th><th>操作</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="5" class="dim">暂无服务器</td></tr>'}</tbody>
       </table>
+      <h2>拨测任务</h2>
+      <div class="toolbar"><button id="btn-add-probe" class="primary">添加拨测</button></div>
+      <table class="list" id="probe-table">
+        <thead><tr><th>名称</th><th>类型</th><th>目标</th><th>间隔</th><th>最近结果</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody><tr><td colspan="7" class="dim">加载中…</td></tr></tbody>
+      </table>
       <h2>系统设置</h2>
       <form id="settings-form" class="settings">
         <div class="row">
@@ -285,6 +318,14 @@ if (typeof document !== 'undefined') {
         <div class="row">
           <label>数据保留 (天)<input name="retentionDays" type="number" min="1" max="3650"></label>
           <label class="wide">Webhook URL<input name="webhookUrl" placeholder="https://..."></label>
+        </div>
+        <div class="row">
+          <label class="wide">Telegram Bot Token<input name="telegram_bot_token" placeholder="123456:ABC-DEF..."></label>
+          <label>Telegram Chat ID<input name="telegram_chat_id" placeholder="-100..."></label>
+        </div>
+        <div class="row">
+          <label class="wide checkbox-label"><input name="public_status" type="checkbox"> 开启公开状态页(无需登录访问 /status)</label>
+          <div class="actions"><button type="button" id="btn-notify-test">发送测试通知</button></div>
         </div>
         <div class="actions"><button type="submit" class="primary">保存设置</button></div>
       </form>
@@ -322,6 +363,9 @@ if (typeof document !== 'undefined') {
     form.elements.notifyCooldownMin.value = settings.notifyCooldownMin;
     form.elements.retentionDays.value = settings.retentionDays;
     form.elements.webhookUrl.value = settings.webhookUrl ?? '';
+    form.elements.telegram_bot_token.value = settings.telegram_bot_token ?? '';
+    form.elements.telegram_chat_id.value = settings.telegram_chat_id ?? '';
+    form.elements.public_status.checked = settings.public_status === true;
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const body = {
@@ -335,16 +379,106 @@ if (typeof document !== 'undefined') {
         notifyCooldownMin: Number(form.elements.notifyCooldownMin.value),
         retentionDays: Number(form.elements.retentionDays.value),
         webhookUrl: form.elements.webhookUrl.value.trim(),
+        public_status: form.elements.public_status.checked,
+        telegram_bot_token: form.elements.telegram_bot_token.value.trim(),
+        telegram_chat_id: form.elements.telegram_chat_id.value.trim(),
       };
-      await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
-      alert('已保存');
+      const saved = await api('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) });
+      if (!saved.ok) alert('保存失败:' + (await saved.json()).error ?? ''); else alert('已保存');
+    });
+    $('#btn-notify-test').addEventListener('click', async () => {
+      const btn = $('#btn-notify-test');
+      btn.disabled = true;
+      try {
+        const res = await api('/api/admin/notify-test', { method: 'POST' });
+        const r = await res.json();
+        const fmt = (v) => v === null || v === undefined ? '未配置' : (v ? '✓ 已发送' : '✗ 失败');
+        alert(`测试结果\nWebhook: ${fmt(r.webhook)}\nTelegram: ${fmt(r.telegram)}`);
+      } finally {
+        btn.disabled = false;
+      }
     });
     $('#password-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const pw = e.target.elements.password.value;
       const res = await api('/api/admin/password', { method: 'POST', body: JSON.stringify({ password: pw }) });
-      if (res.ok) alert('密码已更新'); else alert('更新失败');
+      if (res.ok) alert('密码已更新,所有会话已注销,请重新登录'); else alert('更新失败');
       e.target.reset();
+    });
+
+    await loadProbeTable();
+  }
+
+  async function loadProbeTable() {
+    const probes = await (await api('/api/admin/probes')).json();
+    const tbody = $('#probe-table tbody');
+    if (!tbody) return;
+    tbody.innerHTML = probes.map((p) => `
+      <tr>
+        <td>${escapeHtml(p.name)}</td>
+        <td><span class="tag">${p.type.toUpperCase()}</span></td>
+        <td class="dim">${escapeHtml(p.target)}</td>
+        <td>${p.intervalSec}s</td>
+        <td>${p.latest
+          ? (p.latest.ok ? `✓ ${p.latest.latencyMs != null ? p.latest.latencyMs.toFixed(0) + ' ms' : ''}` : `✗ ${escapeHtml(p.latest.error ?? '')}`)
+          : '<span class="dim">暂无</span>'}</td>
+        <td>${p.enabled ? '启用' : '<span class="dim">停用</span>'}</td>
+        <td class="actions-cell">
+          <button data-pedit="${p.id}">编辑</button>
+          <button class="danger" data-pdel="${p.id}">删除</button>
+        </td>
+      </tr>`).join('') || '<tr><td colspan="7" class="dim">暂无拨测任务</td></tr>';
+    tbody.querySelectorAll('[data-pedit]').forEach((b) => b.addEventListener('click', () => {
+      showProbeForm(probes.find((p) => p.id === Number(b.dataset.pedit)));
+    }));
+    tbody.querySelectorAll('[data-pdel]').forEach((b) => b.addEventListener('click', async () => {
+      if (!confirm('删除该拨测任务及其历史?')) return;
+      await api(`/api/admin/probes/${b.dataset.pdel}`, { method: 'DELETE' });
+      loadProbeTable();
+    }));
+  }
+
+  function showProbeForm(existing) {
+    const p = existing ?? {};
+    const wrap = modal(`
+      <h2>${existing ? '编辑拨测' : '添加拨测'}</h2>
+      <form id="probe-form">
+        <div class="row">
+          <label>名称 *<input name="name" required value="${escapeHtml(p.name ?? '')}" placeholder="网关延迟"></label>
+          <label>类型 *
+            <select name="type">
+              <option value="http"${p.type === 'http' || !p.type ? ' selected' : ''}>HTTP</option>
+              <option value="tcp"${p.type === 'tcp' ? ' selected' : ''}>TCP</option>
+            </select>
+          </label>
+        </div>
+        <label>目标 *<input name="target" required value="${escapeHtml(p.target ?? '')}" placeholder="https://example.com/health 或 1.2.3.4:22"></label>
+        <div class="row">
+          <label>间隔 (秒)<input name="intervalSec" type="number" min="10" max="3600" value="${p.intervalSec ?? 30}"></label>
+          <label>超时 (秒)<input name="timeoutSec" type="number" min="1" max="30" value="${p.timeoutSec ?? 5}"></label>
+          <label>启用<select name="enabled"><option value="1"${p.enabled !== 0 ? ' selected' : ''}>是</option><option value="0"${p.enabled === 0 ? ' selected' : ''}>否</option></select></label>
+        </div>
+        <div class="actions">
+          <button type="button" id="cancel">取消</button>
+          <button type="submit" class="primary">${existing ? '保存' : '创建'}</button>
+        </div>
+      </form>`);
+    wrap.querySelector('#cancel').addEventListener('click', closeModal);
+    wrap.querySelector('#probe-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const body = {
+        name: String(fd.get('name')).trim(),
+        type: String(fd.get('type')),
+        target: String(fd.get('target')).trim(),
+        intervalSec: Number(fd.get('intervalSec')) || 30,
+        timeoutSec: Number(fd.get('timeoutSec')) || 5,
+        enabled: String(fd.get('enabled')) === '1',
+      };
+      const res = existing
+        ? await api(`/api/admin/probes/${existing.id}`, { method: 'PATCH', body: JSON.stringify(body) })
+        : await api('/api/admin/probes', { method: 'POST', body: JSON.stringify(body) });
+      if (!res.ok) alert('保存失败:' + (await res.json()).error ?? ''); else { closeModal(); loadProbeTable(); }
     });
   }
 
@@ -377,12 +511,20 @@ if (typeof document !== 'undefined') {
 
   function renderDetailShell() {
     const s = state.servers.find((x) => x.id === state.detail.id);
+    const bits = [];
+    if (s?.groupName) bits.push(`分组 ${escapeHtml(s.groupName)}`);
+    if (s?.uptimePct24h != null) bits.push(`24h 在线率 ${Number(s.uptimePct24h).toFixed(1)}%`);
+    if (s?.monthlyQuotaBytes > 0) {
+      const used = (s.metric?.monthlyRx ?? 0) + (s.metric?.monthlyTx ?? 0);
+      bits.push(`月流量 ${escapeHtml(fmtBytes(used))} / ${escapeHtml(fmtBytes(s.monthlyQuotaBytes))}`);
+    }
     $('#main').innerHTML = `
       <div class="toolbar">
         <button id="back">← 返回总览</button>
         <h2>${escapeHtml(s?.name ?? `服务器 #${state.detail.id}`)}</h2>
         ${RANGES.map((r) => `<button class="range${r === state.detail.range ? ' active' : ''}" data-range="${r}">${r}</button>`).join('')}
       </div>
+      ${bits.length ? `<div class="meta-line">${bits.map((b) => `<span>${b}</span>`).join('<span class="dim"> · </span>')}</div>` : ''}
       <div id="detail-body"><p class="dim">加载中…</p></div>`;
     $('#back').addEventListener('click', () => { location.hash = '#/'; });
     $('#main').querySelectorAll('[data-range]').forEach((b) => b.addEventListener('click', () => {
@@ -498,7 +640,9 @@ if (typeof document !== 'undefined') {
     const hash = location.hash || '#/';
     document.body.classList.remove('login-mode');
     $('#topbar').style.display = '';
+    if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
     if (hash === '#/login') return renderLogin();
+    if (hash === '#/status') return renderStatus();
     if (hash === '#/admin') {
       try { await showAdmin(); } catch { /* 401 redirected */ }
       return;
@@ -511,6 +655,68 @@ if (typeof document !== 'undefined') {
     // overview
     connectStream();
     await loadOverview();
+  }
+
+  // Public status page (Komari-style): no login required when the hub has
+  // 公开状态页 enabled; everything else on this page is deliberately minimal.
+  async function renderStatus() {
+    stopStream();
+    $('#topbar').style.display = 'none';
+    document.body.classList.add('status-mode');
+    const render = (pub) => {
+      $('#main').innerHTML = `
+        <div class="status-head">
+          <h1>⏱ VPSWatch 状态页</h1>
+          <a class="dim" href="#/">管理面板</a>
+        </div>
+        <div id="status-body">
+          ${pub ? `
+            <table class="list">
+              <thead><tr><th>服务器</th><th>分组</th><th>状态</th><th>24h 在线率</th></tr></thead>
+              <tbody>
+                ${pub.servers.map((s) => `
+                  <tr>
+                    <td>${escapeHtml(s.name)}${s.tag ? ` <span class="tag">${escapeHtml(s.tag)}</span>` : ''}</td>
+                    <td class="dim">${escapeHtml(s.groupName || '—')}</td>
+                    <td>${s.online
+                      ? '<span class="dot on"></span> 在线'
+                      : '<span class="dot off"></span> 离线'}</td>
+                    <td>${Number(s.uptimePct24h ?? 0).toFixed(1)}%</td>
+                  </tr>`).join('') || '<tr><td colspan="4" class="dim">暂无服务器</td></tr>'}
+              </tbody>
+            </table>
+            <h2>拨测</h2>
+            <table class="list">
+              <thead><tr><th>名称</th><th>类型</th><th>目标</th><th>最近结果</th></tr></thead>
+              <tbody>
+                ${pub.probes.map((p) => `
+                  <tr>
+                    <td>${escapeHtml(p.name)}</td>
+                    <td><span class="tag">${p.type.toUpperCase()}</span></td>
+                    <td class="dim">${escapeHtml(p.target)}</td>
+                    <td>${p.ok === null ? '<span class="dim">暂无</span>'
+                      : p.ok ? `<span class="dot on"></span> ${p.latencyMs != null ? p.latencyMs.toFixed(0) + ' ms' : ''}`
+                        : `<span class="dot off"></span> ${escapeHtml(p.error ?? '失败')}`}</td>
+                  </tr>`).join('') || '<tr><td colspan="4" class="dim">暂无拨测任务</td></tr>'}
+              </tbody>
+            </table>`
+            : '<div class="empty">公开状态页未开启。管理员可在「管理 → 系统设置」中开启。</div>'}
+        </div>`;
+    };
+    try {
+      const res = await fetch('/api/public/overview');
+      const pub = res.status === 200 ? await res.json() : null;
+      render(pub);
+      if (pub) state.statusTimer = setInterval(async () => {
+        if (location.hash !== '#/status') return;
+        try {
+          const r = await fetch('/api/public/overview');
+          if (r.status === 200) render(await r.json());
+        } catch { /* transient */ }
+      }, 30_000);
+    } catch {
+      render(null);
+    }
   }
 
   $('#logout').addEventListener('click', async () => {

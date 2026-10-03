@@ -83,6 +83,24 @@ test('minimal valid payload passes with optionals null', () => {
   assert.equal(r.value.processes, null);
   assert.equal(r.value.dailyRx, null);
   assert.equal(r.value.dailyTx, null);
+  assert.equal(r.value.monthlyRx, null);
+  assert.equal(r.value.monthlyTx, null);
+});
+
+test('monthly traffic counters pass through (v1.1 quota support)', () => {
+  const r = validateReport(validReport({
+    daily_rx: 1000,
+    daily_tx: 2000,
+    monthly_rx: 3000,
+    monthly_tx: 4000,
+  }));
+  assert.equal(r.ok, true);
+  assert.equal(r.value.monthlyRx, 3000);
+  assert.equal(r.value.monthlyTx, 4000);
+  const row = normalize(r.value, { prevCounter: null, nowMs: 1, dtSec: 0 });
+  assert.equal(row.monthlyRx, 3000);
+  assert.equal(row.monthlyTx, 4000);
+  assert.equal(validateReport(validReport({ monthly_rx: -1 })).ok, false);
 });
 
 test('accepts full payload with optionals', () => {

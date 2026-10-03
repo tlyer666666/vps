@@ -2,6 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openStore } from '../server/store.js';
 import { sha256hex, newToken } from '../server/secure.js';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 function freshStore() {
   return openStore(':memory:');
@@ -214,4 +218,103 @@ test('newToken is unique and well-formed', () => {
   assert.equal(a.length, 64);
   assert.match(a, /^[0-9a-f]{64}$/);
   assert.notEqual(a, b);
+});
+
+// ---- v1.1 komari-features: migration, probes, uptime -----------------------
+
+test('migrates an old-schema database by adding new columns', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vw-migrate-'));
+  const dbPath = join(dir, 'old.db');
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE servers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, tag TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '', price_cny REAL,
+      expires_at INTEGER, notes TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL,
+      interval_sec INTEGER NOT NULL DEFAULT 10, sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO servers (name, token_hash, created_at) VALUES ('legacy', 'x', 1);
+  `);
+  legacy.close();
+
+  const s = openStore(dbPath);
+  const row = s.getServer(1);
+  assert.equal(row.name, 'legacy');
+  assert.equal(row.groupName, '', 'group_name column added with default');
+  assert.equal(row.monthlyQuotaBytes, null, 'monthly_quota_bytes column added');
+  const created = s.createServer({ name: 'new', groupName: 'grp', monthlyQuotaBytes: 1000 });
+  assert.equal(s.getServer(created.id).groupName, 'grp');
+  s.close();
+});
+
+test('probes CRUD with cascade delete', () => {
+  const s = freshStore();
+  const p = s.createProbe({ name: 'gateway', type: 'http', target: 'https://a.b/', intervalSec: 30, timeoutSec: 5 });
+  assert.equal(typeof p.id, 'number');
+  assert.equal(s.listProbes().length, 1);
+  s.updateProbe(p.id, { name: 'gw2', enabled: 0 });
+  assert.equal(s.listProbes()[0].name, 'gw2');
+  assert.equal(s.listProbes()[0].enabled, 0);
+
+  s.insertProbeResult(p.id, { ts: 1000, ok: 1, latencyMs: 12.5 });
+  s.deleteProbe(p.id);
+  assert.equal(s.listProbes().length, 0);
+  assert.equal(s.db.prepare('SELECT COUNT(*) c FROM probe_results WHERE probe_id=?').get(p.id).c, 0);
+  s.close();
+});
+
+test('probe results: latest map, history with downsampling, prune', () => {
+  const s = freshStore();
+  const p = s.createProbe({ name: 'x', type: 'tcp', target: 'h:1' });
+  for (let i = 0; i < 10; i++) {
+    s.insertProbeResult(p.id, { ts: i * 1000, ok: i % 2, latencyMs: 10 + i, error: i % 2 ? 'timeout' : null });
+  }
+  const latest = s.latestProbeResults();
+  assert.equal(latest.get(p.id).ts, 9000);
+  assert.equal(latest.get(p.id).ok, 1);
+
+  const small = s.getProbeHistory(p.id, 0, 10000, 400);
+  assert.equal(small.downsampled, false);
+  assert.equal(small.points.length, 10);
+  assert.equal(small.points[0].latencyMs, 10);
+
+  const big = s.getProbeHistory(p.id, 0, 10000, 4);
+  assert.equal(big.downsampled, true);
+  assert.ok(big.points.length <= 4);
+  assert.ok(big.points.every((pt) => typeof pt.ts === 'number'));
+  assert.ok(big.points.every((pt) => pt.latencyMs === null || Number.isFinite(pt.latencyMs)));
+
+  const removed = s.pruneProbeResults(5000);
+  assert.equal(removed, 5);
+  assert.equal(s.getProbeHistory(p.id, 0, 10000, 400).points.length, 5);
+  s.close();
+});
+
+test('uptime percentage from metric presence, clamped to 100', () => {
+  const s = freshStore();
+  const a = s.createServer({ name: 'a', intervalSec: 10 });
+  const from = 0;
+  const to = 100 * 10 * 1000; // 100 expected samples at 10s
+  s.insertMetric(a.id, { ts: from, cpuPct: 1 });
+  assert.equal(s.getUptimePct(a.id, from, to, 10), 1, '1 of 100 expected samples = 1%');
+
+  for (let i = 0; i < 300; i++) {
+    s.insertMetric(a.id, { ts: from + i * 1000, cpuPct: 1 }); // way more rows than expected
+  }
+  assert.equal(s.getUptimePct(a.id, from, to, 10), 100, 'clamped to 100');
+  assert.equal(s.getUptimePct(999, from, to, 10), 0, 'no rows = 0%');
+  s.close();
+});
+
+test('getUptimeAll computes per-server uptime in one query', () => {
+  const s = freshStore();
+  const a = s.createServer({ name: 'a', intervalSec: 10 });
+  const b = s.createServer({ name: 'b', intervalSec: 60 });
+  for (let i = 0; i < 60; i++) s.insertMetric(a.id, { ts: i * 10000, cpuPct: 1 }); // 60/60 = 100%
+  s.insertMetric(b.id, { ts: 0, cpuPct: 1 }); // 1 of 60 expected ≈ 1.7
+  const map = s.getUptimeAll(0, 60 * 10 * 1000);
+  assert.equal(map.get(a.id), 100);
+  assert.equal(map.get(b.id), 10, '1 of 10 expected samples (60s interval, 600s window) = 10%');
+  s.close();
 });

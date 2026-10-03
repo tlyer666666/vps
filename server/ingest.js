@@ -104,6 +104,16 @@ function validate(report) {
     : num(report.daily_tx, 0, MAX_COUNTER);
   if (report.daily_tx != null && dailyTx === null) return 'daily_tx out of range';
 
+  const monthlyRx = report.monthly_rx === undefined || report.monthly_rx === null
+    ? null
+    : num(report.monthly_rx, 0, MAX_COUNTER);
+  if (report.monthly_rx != null && monthlyRx === null) return 'monthly_rx out of range';
+
+  const monthlyTx = report.monthly_tx === undefined || report.monthly_tx === null
+    ? null
+    : num(report.monthly_tx, 0, MAX_COUNTER);
+  if (report.monthly_tx != null && monthlyTx === null) return 'monthly_tx out of range';
+
   const hostname = optHostname(report.hostname);
   if (report.hostname && hostname === null) {
     return 'hostname must match [A-Za-z0-9._-]{1,64}';
@@ -125,6 +135,8 @@ function validate(report) {
     txBytes,
     dailyRx,
     dailyTx,
+    monthlyRx,
+    monthlyTx,
     tcpConns,
     processes,
   };
@@ -173,6 +185,8 @@ export function normalize(report, { prevCounter, nowMs, dtSec }) {
     txSpeed: computeSpeed(prevTx, report.txBytes, dtSec),
     dailyRx: report.dailyRx,
     dailyTx: report.dailyTx,
+    monthlyRx: report.monthlyRx,
+    monthlyTx: report.monthlyTx,
     tcpConns: report.tcpConns,
     processes: report.processes,
     uptimeSec: report.uptimeSec,

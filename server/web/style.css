@@ -167,3 +167,11 @@ pre.token, pre.cmd {
   form .row { flex-direction: column; }
   #main { padding: 12px; }
 }
+
+/* public status page (v1.1) */
+body.status-mode #main { max-width: 900px; }
+.status-head { display: flex; align-items: baseline; gap: 18px; margin: 26px 0 18px; }
+.status-head h1 { margin: 0; color: var(--accent); font-size: 20px; }
+.meta-line { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 14px; font-size: 13px; }
+.checkbox-label { flex-direction: row !important; align-items: center; gap: 8px !important; }
+.checkbox-label input { width: auto; }
