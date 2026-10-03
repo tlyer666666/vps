@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { validateReport, normalize } from './ingest.js';
 import { verifyPassword, verifyAgentToken, hashPassword } from './auth.js';
 import { createNotifier } from './notify.js';
+import { sendTelegram } from './telegram.js';
 import { serveStatic } from './static.js';
 import { deepMerge, CONFIG_DEFAULTS } from './config.js';
 
@@ -71,7 +72,7 @@ function sessionTokenOf(req) {
   return null;
 }
 
-export function createApp({ config, store, engine = null, notifier = null, log = console }) {
+export function createApp({ config, store, engine = null, notifier = null, probeRunner = null, log = console }) {
   const webDir = config.webDir ?? join(dirname(fileURLToPath(import.meta.url)), 'web');
 
   // Effective settings = shipped defaults, overlaid with config and persisted admin changes.
@@ -81,6 +82,9 @@ export function createApp({ config, store, engine = null, notifier = null, log =
       thresholds: { ...CONFIG_DEFAULTS.thresholds },
       notifyCooldownMin: CONFIG_DEFAULTS.notifyCooldownMin,
       retentionDays: CONFIG_DEFAULTS.retentionDays,
+      public_status: false,
+      telegram_bot_token: '',
+      telegram_chat_id: '',
     },
     {
       webhookUrl: config.webhookUrl,
@@ -120,7 +124,22 @@ export function createApp({ config, store, engine = null, notifier = null, log =
   let tickTimer = null;
   let pruneTimer = null;
 
+  // 24h uptime percentages, refreshed at most once a minute (single aggregate
+  // query) — buildOverview runs on every broadcast frame and must stay cheap.
+  const uptimeCache = new Map();
+  let uptimeRefreshedAt = 0;
+  function refreshUptime(force = false) {
+    const now = Date.now();
+    if (!force && now - uptimeRefreshedAt < 60_000) return;
+    uptimeRefreshedAt = now;
+    uptimeCache.clear();
+    for (const [serverId, pct] of store.getUptimeAll(now - 24 * 3600 * 1000, now)) {
+      uptimeCache.set(serverId, pct);
+    }
+  }
+
   function buildOverview(now = Date.now()) {
+    refreshUptime();
     const latest = store.latestCached();
     return store.listServers().map((s) => {
       const m = latest.get(s.id) ?? null;
@@ -134,7 +153,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
           diskPct: m.diskTotal > 0 ? Math.round((m.diskUsed / m.diskTotal) * 10000) / 100 : null,
         }
         : null;
-      return { ...s, online, lastSeen: m ? m.ts : null, metric };
+      return { ...s, online, lastSeen: m ? m.ts : null, metric, uptimePct24h: uptimeCache.get(s.id) ?? 0 };
     });
   }
 
@@ -258,6 +277,7 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     }
     try {
       engine?.ingest(server, metric, now);
+      engine?.checkQuota?.(server, metric, now);
     } catch (err) {
       log.warn(`[ingest] alert engine failed for server ${server.id}: ${err.message}`);
     }
@@ -290,6 +310,9 @@ export function createApp({ config, store, engine = null, notifier = null, log =
       thresholds: { ...effective.thresholds },
       notifyCooldownMin: effective.notifyCooldownMin,
       retentionDays: effective.retentionDays,
+      public_status: effective.public_status === true,
+      telegram_bot_token: effective.telegram_bot_token ?? '',
+      telegram_chat_id: effective.telegram_chat_id ?? '',
     };
   }
 
@@ -335,6 +358,17 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         return 'webhookUrl must be empty or an http(s) URL';
       }
     }
+    if (patch.public_status !== undefined && typeof patch.public_status !== 'boolean') {
+      return 'public_status must be a boolean';
+    }
+    if (patch.telegram_bot_token !== undefined) {
+      const t = patch.telegram_bot_token;
+      if (t !== '' && (typeof t !== 'string' || t.length > 200)) return 'telegram_bot_token must be a string of at most 200 characters';
+    }
+    if (patch.telegram_chat_id !== undefined) {
+      const c = patch.telegram_chat_id;
+      if (c !== '' && (typeof c !== 'string' || c.length > 64)) return 'telegram_chat_id must be a string of at most 64 characters';
+    }
     return null;
   }
 
@@ -365,6 +399,46 @@ export function createApp({ config, store, engine = null, notifier = null, log =
     if (body.sortOrder !== undefined && !(Number.isInteger(body.sortOrder) && body.sortOrder >= 0)) {
       return 'sortOrder must be a non-negative integer';
     }
+    if (body.groupName !== undefined && (typeof body.groupName !== 'string' || body.groupName.length > 64)) {
+      return 'groupName must be a string of at most 64 characters';
+    }
+    if (body.monthlyQuotaBytes !== undefined && body.monthlyQuotaBytes !== null
+      && !(Number.isInteger(body.monthlyQuotaBytes) && body.monthlyQuotaBytes >= 0 && body.monthlyQuotaBytes <= 1e18)) {
+      return 'monthlyQuotaBytes must be null or an integer in [0, 1e18]';
+    }
+    return null;
+  }
+
+  // Dial-test probe fields (v1.1).
+  function probeInputError(body, { partial = false } = {}) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return 'body must be an object';
+    if (!partial || body.name !== undefined) {
+      if (typeof body.name !== 'string' || body.name.trim().length < 1 || body.name.trim().length > 100) {
+        return 'name must be a string of 1..100 characters';
+      }
+    }
+    if (!partial || body.type !== undefined) {
+      if (body.type !== 'http' && body.type !== 'tcp') return "type must be 'http' or 'tcp'";
+    }
+    if (!partial || body.target !== undefined) {
+      const t = body.target;
+      if (body.type === 'http') {
+        if (typeof t !== 'string' || t.length > 300 || !/^https?:\/\/.+/i.test(t)) {
+          return 'target must be an http(s) URL for http probes';
+        }
+      } else if (typeof t !== 'string' || !/^[\w.-]+:\d{1,5}$/.test(t) || !(Number(t.slice(t.lastIndexOf(':') + 1)) >= 1 && Number(t.slice(t.lastIndexOf(':') + 1)) <= 65535)) {
+        return 'target must be host:port for tcp probes';
+      }
+    }
+    if (body.intervalSec !== undefined && !isIntIn(body.intervalSec, 10, 3600)) {
+      return 'intervalSec must be an integer in [10, 3600]';
+    }
+    if (body.timeoutSec !== undefined && !isIntIn(body.timeoutSec, 1, 30)) {
+      return 'timeoutSec must be an integer in [1, 30]';
+    }
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+      return 'enabled must be a boolean';
+    }
     return null;
   }
 
@@ -378,6 +452,38 @@ export function createApp({ config, store, engine = null, notifier = null, log =
       }
       if (req.method === 'POST' && path === '/api/login') {
         return await handleLogin(req, res, ip);
+      }
+      if (req.method === 'GET' && path === '/api/public/overview') {
+        // Komari-style public status page: opt-in, anonymous, sanitized.
+        if (effective.public_status !== true) return json(res, 404, { error: 'not found' });
+        refreshUptime(true);
+        const latest = store.latestCached();
+        const now = Date.now();
+        const servers = store.listServers().map((s) => {
+          const m = latest.get(s.id) ?? null;
+          const intervalSec = s.intervalSec ?? config.intervalSec ?? 10;
+          const windowMs = Math.max(intervalSec * 3 * 1000, 60_000);
+          return {
+            id: s.id,
+            name: s.name,
+            tag: s.tag,
+            groupName: s.groupName,
+            online: m !== null && now - m.ts <= windowMs,
+            uptimePct24h: uptimeCache.get(s.id) ?? 0,
+          };
+        });
+        const latestProbes = store.latestProbeResults();
+        const probes = store.listProbes().map((p) => {
+          const l = latestProbes.get(p.id) ?? null;
+          return {
+            id: p.id, name: p.name, type: p.type, target: p.target,
+            ok: l ? l.ok === 1 : null,
+            latencyMs: l ? l.latencyMs : null,
+            error: l ? l.error : null,
+            ts: l ? l.ts : null,
+          };
+        });
+        return json(res, 200, { servers, probes });
       }
       if (!path.startsWith('/api/')) {
         // Distributable install assets so the panel one-liner works out of the box.
@@ -497,6 +603,66 @@ export function createApp({ config, store, engine = null, notifier = null, log =
         res.setHeader('set-cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
         return json(res, 200, { ok: true });
       }
+
+      if (req.method === 'POST' && path === '/api/admin/notify-test') {
+        const event = { id: null, type: 'test', level: 'info', message: 'VPSWatch 通知测试', startedAt: Date.now() };
+        const webhook = effective.webhookUrl ? await notify(event, { name: 'VPSWatch' }) : null;
+        const telegram = (effective.telegram_bot_token && effective.telegram_chat_id)
+          ? await sendTelegram({
+            botToken: effective.telegram_bot_token,
+            chatId: effective.telegram_chat_id,
+            text: `[VPSWatch] ${event.message}`,
+          })
+          : null;
+        return json(res, 200, { webhook, telegram });
+      }
+
+      if (path === '/api/admin/probes' && req.method === 'GET') {
+        const latest = store.latestProbeResults();
+        return json(res, 200, store.listProbes().map((p) => ({ ...p, latest: latest.get(p.id) ?? null })));
+      }
+      if (path === '/api/admin/probes' && req.method === 'POST') {
+        const { raw } = await readBody(req);
+        let body = {};
+        try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+        const err = probeInputError(body);
+        if (err) return json(res, 400, { error: err });
+        const probe = store.createProbe(body);
+        broadcast();
+        return json(res, 200, probe);
+      }
+      const probeMatch = path.match(/^\/api\/admin\/probes\/(\d+)$/);
+      if (probeMatch) {
+        const pid = Number(probeMatch[1]);
+        if (!store.getProbe(pid)) return json(res, 404, { error: 'no such probe' });
+        if (req.method === 'PATCH') {
+          const { raw } = await readBody(req);
+          let body = {};
+          try { body = JSON.parse(raw ?? '{}'); } catch { return json(res, 400, { error: 'invalid json' }); }
+          const err = probeInputError(body, { partial: true });
+          if (err) return json(res, 400, { error: err });
+          if (typeof body.enabled === 'boolean') body.enabled = body.enabled ? 1 : 0;
+          store.updateProbe(pid, body);
+          broadcast();
+          return json(res, 200, { ok: true });
+        }
+        if (req.method === 'DELETE') {
+          store.deleteProbe(pid);
+          probeRunner?.forget?.(pid);
+          broadcast();
+          return json(res, 200, { ok: true });
+        }
+      }
+      const probeHistoryMatch = path.match(/^\/api\/probes\/(\d+)\/history$/);
+      if (req.method === 'GET' && probeHistoryMatch) {
+        const pid = Number(probeHistoryMatch[1]);
+        if (!store.getProbe(pid)) return json(res, 404, { error: 'no such probe' });
+        const range = url.searchParams.get('range') ?? '24h';
+        const span = RANGES[range];
+        if (!span) return json(res, 400, { error: 'range must be one of ' + Object.keys(RANGES).join('|') });
+        const now = Date.now();
+        return json(res, 200, { range, ...store.getProbeHistory(pid, now - span, now) });
+      }
       return json(res, 404, { error: 'not found' });
     } catch (err) {
       log.error(`[http] ${req.method} ${path}: ${err.stack ?? err}`);
@@ -534,8 +700,9 @@ export function createApp({ config, store, engine = null, notifier = null, log =
           const removed = store.pruneOlderThan(cutoff);
           const sessions = store.deleteExpiredSessions();
           const events = store.pruneResolvedEvents(cutoff);
-          if (removed > 0 || sessions > 0 || events > 0) {
-            log.info(`[prune] removed ${removed} metrics, ${sessions} sessions, ${events} resolved events`);
+          const probeResults = store.pruneProbeResults(cutoff);
+          if (removed > 0 || sessions > 0 || events > 0 || probeResults > 0) {
+            log.info(`[prune] removed ${removed} metrics, ${sessions} sessions, ${events} events, ${probeResults} probe results`);
           }
         } catch (err) {
           log.error(`[prune] ${err.stack ?? err}`);

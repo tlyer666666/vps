@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createApp } from '../server/http.js';
 import { openStore } from '../server/store.js';
 import { AlertEngine } from '../server/alerts.js';
+import { createProbeRunner } from '../server/probes.js';
 import { hashPassword } from '../server/auth.js';
 
 const PORT = 0;
@@ -19,10 +20,14 @@ async function startApp({ password = PASSWORD } = {}) {
     notifyCooldownMin: 10,
     onNotify: (event, server) => notified.push(event),
   });
+  const probeRunner = createProbeRunner(store, {
+    onNotify: (event, probe) => notified.push(event),
+  });
   const app = createApp({
     config: { intervalSec: 10, retentionDays: 30, rate: { agentPerSec: 30, loginPer15Min: 5 } },
     store,
     engine,
+    probeRunner,
     log: { info: () => {}, warn: () => {}, error: () => {} },
   });
   const server = app.listen(PORT, '127.0.0.1');
@@ -611,5 +616,169 @@ test('events limit clamps negatives and large values (review finding 6)', async 
   assert.equal(neg.length, 3, 'negative limit must not become unlimited/0/error');
   const two = await (await h.call('/api/events?limit=2')).json();
   assert.equal(two.length, 2);
+  h.close();
+});
+
+// ---- v1.1 komari features: probes, public status page, notify test ----
+
+function startAppWithRunner({ password = PASSWORD } = {}) {
+  return startApp({ password });
+}
+
+test('probe CRUD with validation and embedded latest results', async () => {
+  const h = await startAppWithRunner();
+  await login(h);
+  const bad = [
+    { name: '', type: 'http', target: 'https://a.b/' },
+    { name: 'x', type: 'ftp', target: 'https://a.b/' },
+    { name: 'x', type: 'http', target: 'ftp://a.b/' },
+    { name: 'x', type: 'tcp', target: 'no-port' },
+    { name: 'x', type: 'tcp', target: 'host:99999' },
+    { name: 'x', type: 'http', target: 'https://a.b/', intervalSec: 5 },
+    { name: 'x', type: 'http', target: 'https://a.b/', timeoutSec: 60 },
+  ];
+  for (const body of bad) {
+    const res = await h.call('/api/admin/probes', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}`);
+  }
+
+  const create = await h.call('/api/admin/probes', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'gateway', type: 'http', target: 'https://gw.example/health', intervalSec: 30 }),
+  });
+  if (create.status !== 200) {
+    console.error('[dbg] create status', create.status, 'body:', await create.text());
+  }
+  assert.equal(create.status, 200);
+  const probe = await create.json();
+
+  const list = await (await h.call('/api/admin/probes')).json();
+  assert.equal(list.length, 1);
+  assert.equal(list[0].name, 'gateway');
+  assert.equal(list[0].latest, null, 'no result yet');
+
+  h.store.insertProbeResult(probe.id, { ts: Date.now(), ok: 0, latencyMs: 5, error: 'HTTP 503' });
+  const list2 = await (await h.call('/api/admin/probes')).json();
+  assert.equal(list2[0].latest.ok, 0);
+  assert.equal(list2[0].latest.error, 'HTTP 503');
+
+  const patch = await h.call(`/api/admin/probes/${probe.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(patch.status, 200);
+  assert.equal((await (await h.call('/api/admin/probes')).json())[0].enabled, 0);
+
+  assert.equal((await h.call(`/api/admin/probes/${probe.id}`, { method: 'DELETE' })).status, 200);
+  assert.deepEqual(await (await h.call('/api/admin/probes')).json(), []);
+  h.close();
+});
+
+test('probe history endpoint returns points', async () => {
+  const h = await startAppWithRunner();
+  await login(h);
+  const probe = h.store.createProbe({ name: 'p', type: 'tcp', target: '127.0.0.1:22' });
+  for (let i = 0; i < 5; i++) {
+    h.store.insertProbeResult(probe.id, { ts: Date.now() - (5 - i) * 1000, ok: 1, latencyMs: 10 + i });
+  }
+  const hist = await (await h.call(`/api/probes/${probe.id}/history?range=1h`)).json();
+  assert.equal(hist.points.length, 5);
+  assert.equal(hist.points[4].latencyMs, 14);
+  h.close();
+});
+
+test('public overview is gated and sanitized (v1.1 status page)', async () => {
+  const h = await startAppWithRunner();
+  await login(h);
+  const { id } = await (await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'pub-1', tag: 'hk', provider: 'SecretProvider', notes: 'secret notes', groupName: 'prod' }),
+  })).json();
+  h.store.insertMetric(id, { ts: Date.now(), cpuPct: 10 });
+  const probe = h.store.createProbe({ name: 'gw', type: 'http', target: 'https://a.b/' });
+
+  // disabled by default → 404
+  assert.equal((await h.call('/api/public/overview')).status, 404);
+
+  await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ public_status: true }),
+  });
+
+  // public route must work WITHOUT cookies
+  const anon = await fetch(`${h.base}/api/public/overview`);
+  assert.equal(anon.status, 200);
+  const pub = await anon.json();
+  assert.equal(pub.servers.length, 1);
+  assert.equal(pub.servers[0].name, 'pub-1');
+  assert.equal(pub.servers[0].groupName, 'prod');
+  assert.equal(typeof pub.servers[0].online, 'boolean');
+  assert.ok(!('priceCny' in pub.servers[0]) && !('notes' in pub.servers[0]), 'private fields must not leak');
+  assert.equal(pub.probes.length, 1);
+  assert.equal(pub.probes[0].name, 'gw');
+
+  // authed probe uptime data present
+  assert.equal(typeof pub.servers[0].uptimePct24h, 'number');
+  assert.equal(pub.probes[0].id, probe.id);
+  h.close();
+});
+
+test('notify-test reports per-channel delivery results', async () => {
+  const h = await startAppWithRunner();
+  await login(h);
+  await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ webhookUrl: 'http://127.0.0.1:9/hook' /* refused */, telegram_bot_token: '123:x', telegram_chat_id: '42' }),
+  });
+  const res = await h.call('/api/admin/notify-test', { method: 'POST' });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.deepEqual(body, { webhook: false, telegram: false }, 'both channels attempted; refused/unreachable = false');
+
+  // empty config: channels report null (not configured)
+  await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ webhookUrl: '', telegram_bot_token: '', telegram_chat_id: '' }),
+  });
+  const res2 = await h.call('/api/admin/notify-test', { method: 'POST' });
+  assert.deepEqual(await res2.json(), { webhook: null, telegram: null });
+  h.close();
+});
+
+test('server group and quota fields validate and persist', async () => {
+  const h = await startAppWithRunner();
+  await login(h);
+  assert.equal((await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'g', groupName: 'x'.repeat(65) }),
+  })).status, 400);
+  assert.equal((await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'g', monthlyQuotaBytes: -1 }),
+  })).status, 400);
+
+  const create = await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'g', groupName: '生产', monthlyQuotaBytes: 1024 ** 3 }),
+  });
+  assert.equal(create.status, 200);
+  const { id } = await create.json();
+  const overview = await (await h.call('/api/overview')).json();
+  assert.equal(overview[0].groupName, '生产');
+  assert.equal(overview[0].monthlyQuotaBytes, 1024 ** 3);
+  assert.equal((await h.call(`/api/admin/servers/${id}`)).status, 200);
   h.close();
 });

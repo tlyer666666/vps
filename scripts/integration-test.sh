@@ -219,7 +219,39 @@ curl -s "$BASE/" | grep -q '<title>VPSWatch' || die "dashboard html not served"
 curl -s -o /dev/null -w '%{http_code}' "$BASE/install-agent.sh" | grep -q 200 || die "install-agent.sh not served"
 ok "dashboard and install script are served"
 
-# ---------- scene 11: retention prune on the real db ---------------------------
+# ---------- scene 12: dial-test probe runs against the hub itself ----------
+curl -s -b "$JAR" -H 'content-type: application/json' \
+  -d "{\"name\":\"self\",\"type\":\"http\",\"target\":\"$BASE/\",\"intervalSec\":10,\"timeoutSec\":5}" \
+  "$BASE/api/admin/probes" > "$TMP/probe.json"
+[ "$(jget id < "$TMP/probe.json")" != "undefined" ] || die "probe creation failed"
+probefound=0
+for _ in $(seq 1 10); do
+  sleep 1.5
+  curl -s -b "$JAR" "$BASE/api/admin/probes" > "$TMP/probes.json"
+  ok=$(jget '0.latest.ok' < "$TMP/probes.json")
+  [ "$ok" = "1" ] && { probefound=1; break; }
+done
+[ "$probefound" -eq 1 ] || die "probe never recorded a success: $(cat "$TMP/probes.json")"
+lat=$(jget '0.latest.latencyMs' < "$TMP/probes.json")
+echo "... probe latency ${lat} ms"
+ok "dial-test probe records success against the hub"
+
+# ---------- scene 13: public status page toggle ----------
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/public/overview")
+[ "$code" = "404" ] || die "public overview must be 404 while disabled (got $code)"
+curl -s -b "$JAR" -X PUT -H 'content-type: application/json' \
+  -d '{"public_status":true}' "$BASE/api/admin/settings" > /dev/null
+curl -s "$BASE/api/public/overview" > "$TMP/public.json"
+[ "$(jget 'servers.0.name' < "$TMP/public.json")" = "alpha" ] || die "public overview missing servers"
+[ "$(jget 'servers.0.notes' < "$TMP/public.json")" = "undefined" ] || die "public overview leaked notes"
+[ "$(jget 'servers.0.priceCny' < "$TMP/public.json")" = "undefined" ] || die "public overview leaked price"
+if grep -q 'SecretProvider' "$TMP/public.json"; then die "public overview leaked provider"; fi
+curl -s -o /dev/null -w '%{http_code}' "$BASE/api/public/overview" | grep -q 200 || die "public overview not 200 when enabled"
+curl -s -b "$JAR" -X PUT -H 'content-type: application/json' \
+  -d '{"public_status":false}' "$BASE/api/admin/settings" > /dev/null
+ok "public status page gated and sanitized"
+
+# ---------- scene 14: retention prune on the real db ---------------------------
 kill "$HUB_PID" 2>/dev/null; wait "$HUB_PID" 2>/dev/null; HUB_PID=""
 node -e '
 const { openStore } = require("./server/store.js");
