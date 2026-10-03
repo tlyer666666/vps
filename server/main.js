@@ -6,7 +6,7 @@ import { loadConfig, deepMerge } from './config.js';
 import { openStore } from './store.js';
 import { hashPassword } from './auth.js';
 import { AlertEngine } from './alerts.js';
-import { createNotifier } from './notify.js';
+import { createNotifier, createDispatch } from './notify.js';
 import { sendTelegram } from './telegram.js';
 import { createProbeRunner, seedDefaultProbes } from './probes.js';
 import { createApp } from './http.js';
@@ -30,22 +30,9 @@ const notifyCooldownMin = saved.notifyCooldownMin ?? config.notifyCooldownMin;
 
 const notifier = createNotifier({ webhookUrl: () => store.getSetting('settings', {})?.webhookUrl ?? '' });
 
-// Every alert channel fires in parallel; one dead channel never blocks the others.
-async function dispatch(event, subject) {
-  const settings = store.getSetting('settings', {}) ?? {};
-  const tasks = [notifier(event, subject)];
-  if (settings.telegram_bot_token && settings.telegram_chat_id) {
-    tasks.push(sendTelegram({
-      botToken: settings.telegram_bot_token,
-      chatId: settings.telegram_chat_id,
-      text: `[VPSWatch] ${event.message}`,
-    }));
-  }
-  const results = await Promise.allSettled(tasks);
-  results.forEach((r, i) => {
-    if (r.status === 'rejected') console.warn(`[notify] channel ${i} failed: ${r.reason?.message ?? r.reason}`);
-  });
-}
+// Every alert channel fires in parallel; one dead channel or a failing
+// settings read never crashes the hub (createDispatch catches everything).
+const dispatch = createDispatch({ store, notifier, sendTelegram });
 
 const engine = new AlertEngine(store, {
   thresholds,
@@ -77,3 +64,8 @@ function shutdown(signal) {
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+// Last-resort guard: a stray rejection must log, never kill a months-long
+// monitoring process (sendTelegram/notifier already catch internally).
+process.on('unhandledRejection', (reason) => {
+  console.error(`[fatal-guard] unhandled rejection: ${reason?.stack ?? reason}`);
+});

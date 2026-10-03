@@ -755,6 +755,38 @@ test('notify-test reports per-channel delivery results', async () => {
   h.close();
 });
 
+test('public overview is cached and rate limited (iteration 4)', async () => {
+  const h = await startAppWithRunner();
+  await login(h);
+  await h.call('/api/admin/servers', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'pub' }),
+  });
+  await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ public_status: true }),
+  });
+
+  // hammering the anonymous endpoint hits the per-IP rate limit
+  const codes = [];
+  for (let i = 0; i < 30; i++) {
+    codes.push((await fetch(`${h.base}/api/public/overview`)).status);
+  }
+  assert.ok(codes.filter((c) => c === 200).length >= 5, 'legitimate requests succeed');
+  assert.ok(codes.includes(429), 'a burst must hit the 5 req/s public limit');
+
+  // settings change invalidates the cached payload immediately
+  await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ public_status: false }),
+  });
+  assert.equal((await fetch(`${h.base}/api/public/overview`)).status, 404, 'disabled beats the cache');
+  h.close();
+});
+
 test('server group and quota fields validate and persist', async () => {
   const h = await startAppWithRunner();
   await login(h);

@@ -175,7 +175,7 @@ if (typeof document !== 'undefined') {
     presetSel.addEventListener('change', () => {
       urlInput.disabled = presetSel.value !== '__custom';
     });
-    urlInput.disabled = wall.preset !== '__custom' && !!wall.url;
+    urlInput.disabled = presetSel.value !== '__custom';
     wrap.querySelector('#clear-wall').addEventListener('click', () => {
       localStorage.removeItem('vw_wallpaper');
       applyAppearance();
@@ -647,6 +647,7 @@ if (typeof document !== 'undefined') {
       const used = (s.metric?.monthlyRx ?? 0) + (s.metric?.monthlyTx ?? 0);
       bits.push(`月流量 ${escapeHtml(fmtBytes(used))} / ${escapeHtml(fmtBytes(s.monthlyQuotaBytes))}`);
     }
+    if (s?.notes) bits.push(escapeHtml(s.notes));
     $('#main').innerHTML = `
       <div class="toolbar">
         <button id="back">← 返回总览</button>
@@ -768,6 +769,7 @@ if (typeof document !== 'undefined') {
   async function route() {
     const hash = location.hash || '#/';
     document.body.classList.remove('login-mode');
+    document.body.classList.remove('status-mode');
     $('#topbar').style.display = '';
     if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
     if (hash === '#/login') return renderLogin();
@@ -792,6 +794,8 @@ if (typeof document !== 'undefined') {
     stopStream();
     $('#topbar').style.display = 'none';
     document.body.classList.add('status-mode');
+    const generation = state.statusGeneration = (state.statusGeneration ?? 0) + 1;
+    const isCurrent = () => location.hash === '#/status' && generation === state.statusGeneration;
     const render = (pub) => {
       const spark = (h) => {
         const pts = (h ?? []).filter((x) => x.latencyMs != null).map((x) => ({ x: x.ts, y: x.latencyMs }));
@@ -842,16 +846,16 @@ if (typeof document !== 'undefined') {
     try {
       const res = await fetch('/api/public/overview');
       const pub = res.status === 200 ? await res.json() : null;
-      render(pub);
+      if (isCurrent()) render(pub);
       if (pub) state.statusTimer = setInterval(async () => {
-        if (location.hash !== '#/status') return;
+        if (!isCurrent()) return;
         try {
           const r = await fetch('/api/public/overview');
           if (r.status === 200) render(await r.json());
         } catch { /* transient */ }
       }, 30_000);
     } catch {
-      render(null);
+      if (isCurrent()) render(null);
     }
   }
 
