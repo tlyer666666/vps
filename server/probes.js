@@ -6,6 +6,31 @@ const FAIL_THRESHOLD = 3;
 const NOTIFY_COOLDOWN_MS = 10 * 60_000;
 const TICK_MS = 5000;
 
+// Built-in dial-test presets, seeded once on a fresh install and offered as
+// one-click additions in the admin UI. Targets are public anycast endpoints.
+export const DEFAULT_PROBES = [
+  { name: 'Cloudflare', type: 'http', target: 'https://cp.cloudflare.com/generate_204', intervalSec: 60, timeoutSec: 5 },
+  { name: 'Google 204', type: 'http', target: 'https://www.gstatic.com/generate_204', intervalSec: 60, timeoutSec: 5 },
+  { name: '阿里 DNS', type: 'tcp', target: '223.5.5.5:53', intervalSec: 60, timeoutSec: 5 },
+  { name: 'GitHub API', type: 'http', target: 'https://api.github.com/', intervalSec: 60, timeoutSec: 5 },
+];
+
+// Seed the built-in presets exactly once per installation: only when no
+// previous seed ran AND the probes table is empty, and never re-adding a
+// preset the user deliberately deleted.
+export function seedDefaultProbes(store) {
+  if (store.getSetting('probes_seeded', false)) return 0;
+  const existing = new Set(store.listProbes().map((p) => p.target));
+  let added = 0;
+  for (const preset of DEFAULT_PROBES) {
+    if (existing.has(preset.target)) continue;
+    store.createProbe({ ...preset, enabled: 1 });
+    added += 1;
+  }
+  store.setSetting('probes_seeded', true);
+  return added;
+}
+
 function httpProbe(target, timeoutSec, fetchImpl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);

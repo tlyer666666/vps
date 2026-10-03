@@ -1,7 +1,7 @@
 // VPSWatch dashboard SPA. Pure render helpers are exported for node --test;
 // everything DOM lives inside the `typeof document` guard below.
 import {
-  fmtBytes, fmtBytesPerSec, fmtUptime, fmtCountdown, fmtPct, linePath, downsampleRender,
+  fmtBytes, fmtBytesPerSec, fmtUptime, fmtCountdown, fmtPct, fmtRel, linePath, downsampleRender,
 } from './charts.js';
 
 const DAY = 86400_000;
@@ -58,7 +58,7 @@ export function renderCards(servers, nowMs = Date.now()) {
         </div>
         <footer>
           <span>在线率 ${s.uptimePct24h != null ? Number(s.uptimePct24h).toFixed(1) + '%' : '—'} · 运行 ${escapeHtml(fmtUptime(m.uptimeSec))}</span>
-          <span>TCP ${m.tcpConns ?? '—'} · 进程 ${m.processes ?? '—'}</span>
+          <span>上报 ${escapeHtml(fmtRel(s.lastSeen, nowMs))}</span>
         </footer>`
       : '<div class="nodata">暂无数据,等待上报…</div>';
     const meta = [
@@ -104,6 +104,103 @@ if (typeof document !== 'undefined') {
     }
     return res;
   }
+
+  // ---- appearance (theme + wallpaper), per-browser localStorage (v1.2) ----
+
+  const WALLPAPERS = {
+    aurora: 'radial-gradient(1200px 600px at 15% -10%, rgba(76, 194, 255, .35), transparent 60%),' +
+      'radial-gradient(1000px 500px at 85% 0%, rgba(157, 123, 255, .3), transparent 55%),' +
+      'radial-gradient(900px 700px at 50% 110%, rgba(55, 214, 122, .22), transparent 60%)',
+    night: 'linear-gradient(180deg, #0a1230 0%, #101a38 45%, #1c1035 100%)',
+    grid: 'linear-gradient(rgba(76,194,255,.07) 1px, transparent 1px),' +
+      'linear-gradient(90deg, rgba(76,194,255,.07) 1px, transparent 1px)',
+  };
+
+  function applyAppearance() {
+    const theme = localStorage.getItem('vw_theme') ?? 'dark';
+    if (theme === 'dark') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = theme;
+    const wall = localStorage.getItem('vw_wallpaper'); // JSON: {preset} or {url}
+    if (wall) {
+      try {
+        const parsed = JSON.parse(wall);
+        const image = parsed.url || WALLPAPERS[parsed.preset];
+        if (image) {
+          document.body.style.backgroundImage = image;
+          document.body.classList.add('has-wallpaper');
+          return;
+        }
+      } catch { /* corrupted pref falls back to none */ }
+    }
+    document.body.style.backgroundImage = '';
+    document.body.classList.remove('has-wallpaper');
+  }
+
+  function showAppearance() {
+    const theme = localStorage.getItem('vw_theme') ?? 'dark';
+    const wall = (() => {
+      try { return JSON.parse(localStorage.getItem('vw_wallpaper') ?? '{}'); } catch { return {}; }
+    })();
+    const wrap = modal(`
+      <h2>🎨 外观</h2>
+      <form id="appearance-form">
+        <div class="row">
+          <label>主题
+            <select name="theme">
+              <option value="dark"${theme === 'dark' ? ' selected' : ''}>暗色(默认)</option>
+              <option value="light"${theme === 'light' ? ' selected' : ''}>浅色</option>
+              <option value="midnight"${theme === 'midnight' ? ' selected' : ''}>午夜蓝</option>
+            </select>
+          </label>
+          <label>壁纸
+            <select name="preset">
+              <option value="">无</option>
+              <option value="aurora"${wall.preset === 'aurora' ? ' selected' : ''}>极光渐变</option>
+              <option value="night"${wall.preset === 'night' ? ' selected' : ''}>夜空</option>
+              <option value="grid"${wall.preset === 'grid' ? ' selected' : ''}>网格</option>
+              <option value="__custom"${wall.url ? ' selected' : ''}>自定义 URL</option>
+            </select>
+          </label>
+        </div>
+        <label class="wide">自定义壁纸 URL<input name="url" value="${escapeHtml(wall.url ?? '')}" placeholder="https://..."></label>
+        <p class="dim">偏好保存在本浏览器,不影响其他访问者。</p>
+        <div class="actions">
+          <button type="button" id="clear-wall">清除壁纸</button>
+          <button type="submit" class="primary">应用</button>
+        </div>
+      </form>`);
+    const form = wrap.querySelector('#appearance-form');
+    const presetSel = form.elements.preset;
+    const urlInput = form.elements.url;
+    presetSel.addEventListener('change', () => {
+      urlInput.disabled = presetSel.value !== '__custom';
+    });
+    urlInput.disabled = presetSel.value !== '__custom';
+    wrap.querySelector('#clear-wall').addEventListener('click', () => {
+      localStorage.removeItem('vw_wallpaper');
+      applyAppearance();
+      closeModal();
+    });
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      localStorage.setItem('vw_theme', form.elements.theme.value);
+      const value = presetSel.value;
+      if (value === '') localStorage.removeItem('vw_wallpaper');
+      else if (value === '__custom') localStorage.setItem('vw_wallpaper', JSON.stringify({ url: urlInput.value.trim() }));
+      else localStorage.setItem('vw_wallpaper', JSON.stringify({ preset: value }));
+      applyAppearance();
+      closeModal();
+    });
+  }
+
+  // ---- dial-test presets mirrored from server/probes.js DEFAULT_PROBES ----
+
+  const PROBE_PRESETS = [
+    { name: 'Cloudflare', type: 'http', target: 'https://cp.cloudflare.com/generate_204', intervalSec: 60, timeoutSec: 5 },
+    { name: 'Google 204', type: 'http', target: 'https://www.gstatic.com/generate_204', intervalSec: 60, timeoutSec: 5 },
+    { name: '阿里 DNS', type: 'tcp', target: '223.5.5.5:53', intervalSec: 60, timeoutSec: 5 },
+    { name: 'GitHub API', type: 'http', target: 'https://api.github.com/', intervalSec: 60, timeoutSec: 5 },
+  ];
 
   function filteredServers() {
     let list = [...state.servers];
@@ -298,7 +395,10 @@ if (typeof document !== 'undefined') {
         <tbody>${rows || '<tr><td colspan="5" class="dim">暂无服务器</td></tr>'}</tbody>
       </table>
       <h2>拨测任务</h2>
-      <div class="toolbar"><button id="btn-add-probe" class="primary">添加拨测</button></div>
+      <div class="toolbar">
+        <button id="btn-add-probe" class="primary">添加拨测</button>
+        <button id="btn-probe-presets">一键添加常用拨测点</button>
+      </div>
       <table class="list" id="probe-table">
         <thead><tr><th>名称</th><th>类型</th><th>目标</th><th>间隔</th><th>最近结果</th><th>状态</th><th>操作</th></tr></thead>
         <tbody><tr><td colspan="7" class="dim">加载中…</td></tr></tbody>
@@ -339,6 +439,18 @@ if (typeof document !== 'undefined') {
 
     $('#back').addEventListener('click', () => { location.hash = '#/'; });
     $('#btn-add2').addEventListener('click', () => showServerForm(null));
+    $('#btn-add-probe').addEventListener('click', () => showProbeForm(null));
+    $('#btn-probe-presets').addEventListener('click', async () => {
+      const probes = await (await api('/api/admin/probes')).json();
+      const targets = new Set(probes.map((p) => p.target));
+      const missing = PROBE_PRESETS.filter((p) => !targets.has(p.target));
+      if (!missing.length) { alert('常用拨测点已全部存在'); return; }
+      for (const p of missing) {
+        await api('/api/admin/probes', { method: 'POST', body: JSON.stringify(p) });
+      }
+      await loadProbeTable();
+      alert(`已添加 ${missing.length} 个常用拨测点`);
+    });
     $('#main').querySelectorAll('[data-edit]').forEach((b) => b.addEventListener('click', () => {
       showServerForm(state.servers.find((s) => s.id === Number(b.dataset.edit)));
     }));
@@ -443,6 +555,12 @@ if (typeof document !== 'undefined') {
     const wrap = modal(`
       <h2>${existing ? '编辑拨测' : '添加拨测'}</h2>
       <form id="probe-form">
+        ${existing ? '' : `<label>常用预设
+          <select name="preset">
+            <option value="">自定义</option>
+            ${PROBE_PRESETS.map((preset, i) => `<option value="${i}">${escapeHtml(preset.name)}(${escapeHtml(preset.target)})</option>`).join('')}
+          </select>
+        </label>`}
         <div class="row">
           <label>名称 *<input name="name" required value="${escapeHtml(p.name ?? '')}" placeholder="网关延迟"></label>
           <label>类型 *
@@ -464,6 +582,17 @@ if (typeof document !== 'undefined') {
         </div>
       </form>`);
     wrap.querySelector('#cancel').addEventListener('click', closeModal);
+    const presetSel = wrap.querySelector('[name="preset"]');
+    presetSel?.addEventListener('change', () => {
+      const preset = PROBE_PRESETS[Number(presetSel.value)];
+      if (!preset) return;
+      const f = wrap.querySelector('#probe-form').elements;
+      f.name.value = preset.name;
+      f.type.value = preset.type;
+      f.target.value = preset.target;
+      f.intervalSec.value = preset.intervalSec;
+      f.timeoutSec.value = preset.timeoutSec;
+    });
     wrap.querySelector('#probe-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
@@ -518,6 +647,7 @@ if (typeof document !== 'undefined') {
       const used = (s.metric?.monthlyRx ?? 0) + (s.metric?.monthlyTx ?? 0);
       bits.push(`月流量 ${escapeHtml(fmtBytes(used))} / ${escapeHtml(fmtBytes(s.monthlyQuotaBytes))}`);
     }
+    if (s?.notes) bits.push(escapeHtml(s.notes));
     $('#main').innerHTML = `
       <div class="toolbar">
         <button id="back">← 返回总览</button>
@@ -639,6 +769,7 @@ if (typeof document !== 'undefined') {
   async function route() {
     const hash = location.hash || '#/';
     document.body.classList.remove('login-mode');
+    document.body.classList.remove('status-mode');
     $('#topbar').style.display = '';
     if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
     if (hash === '#/login') return renderLogin();
@@ -663,7 +794,16 @@ if (typeof document !== 'undefined') {
     stopStream();
     $('#topbar').style.display = 'none';
     document.body.classList.add('status-mode');
+    const generation = state.statusGeneration = (state.statusGeneration ?? 0) + 1;
+    const isCurrent = () => location.hash === '#/status' && generation === state.statusGeneration;
     const render = (pub) => {
+      const spark = (h) => {
+        const pts = (h ?? []).filter((x) => x.latencyMs != null).map((x) => ({ x: x.ts, y: x.latencyMs }));
+        if (pts.length < 2) return '';
+        const max = Math.max(...pts.map((p) => p.y));
+        const d = linePath(pts, { w: 120, h: 28, pad: 2, min: 0, max: max * 1.1 || 1 });
+        return `<svg class="spark" viewBox="0 0 120 28"><path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;
+      };
       $('#main').innerHTML = `
         <div class="status-head">
           <h1>⏱ VPSWatch 状态页</h1>
@@ -695,8 +835,8 @@ if (typeof document !== 'undefined') {
                     <td><span class="tag">${p.type.toUpperCase()}</span></td>
                     <td class="dim">${escapeHtml(p.target)}</td>
                     <td>${p.ok === null ? '<span class="dim">暂无</span>'
-                      : p.ok ? `<span class="dot on"></span> ${p.latencyMs != null ? p.latencyMs.toFixed(0) + ' ms' : ''}`
-                        : `<span class="dot off"></span> ${escapeHtml(p.error ?? '失败')}`}</td>
+                      : p.ok ? `<span class="dot on"></span> ${p.latencyMs != null ? p.latencyMs.toFixed(0) + ' ms' : ''} ${spark(p.history24h)}`
+                        : `<span class="dot off"></span> ${escapeHtml(p.error ?? '失败')} ${spark(p.history24h)}`}</td>
                   </tr>`).join('') || '<tr><td colspan="4" class="dim">暂无拨测任务</td></tr>'}
               </tbody>
             </table>`
@@ -706,16 +846,16 @@ if (typeof document !== 'undefined') {
     try {
       const res = await fetch('/api/public/overview');
       const pub = res.status === 200 ? await res.json() : null;
-      render(pub);
+      if (isCurrent()) render(pub);
       if (pub) state.statusTimer = setInterval(async () => {
-        if (location.hash !== '#/status') return;
+        if (!isCurrent()) return;
         try {
           const r = await fetch('/api/public/overview');
           if (r.status === 200) render(await r.json());
         } catch { /* transient */ }
       }, 30_000);
     } catch {
-      render(null);
+      if (isCurrent()) render(null);
     }
   }
 
@@ -727,5 +867,7 @@ if (typeof document !== 'undefined') {
   });
 
   window.addEventListener('hashchange', route);
+  applyAppearance();
+  $('#btn-appearance').addEventListener('click', showAppearance);
   route();
 }

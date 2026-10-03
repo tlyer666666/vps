@@ -36,3 +36,36 @@ export function createNotifier({ webhookUrl, fetchImpl = fetch, timeoutMs = 5000
     }
   };
 }
+
+// Notification dispatcher: reads the admin settings, fans the event out to
+// every configured channel in parallel, and NEVER throws — a dead channel or
+// a failing settings read must not crash the hub (review iteration 4).
+export function createDispatch({ store, notifier, sendTelegram: telegramImpl }) {
+  return async function dispatch(event, subject) {
+    let channels;
+    try {
+      const settings = store.getSetting('settings', {}) ?? {};
+      channels = [];
+      if (settings.webhookUrl) {
+        channels.push(() => notifier(event, subject));
+      }
+      if (settings.telegram_bot_token && settings.telegram_chat_id) {
+        channels.push(() => telegramImpl({
+          botToken: settings.telegram_bot_token,
+          chatId: settings.telegram_chat_id,
+          text: `[VPSWatch] ${event.message}`,
+        }));
+      }
+    } catch (err) {
+      console.warn(`[notify] cannot read settings, notification dropped: ${err.message}`);
+      return false;
+    }
+    if (!channels.length) return false;
+    const results = await Promise.allSettled(channels.map((run) => run()));
+    const delivered = results.map((r) => r.status === 'fulfilled' && r.value === true);
+    if (delivered.some((ok) => !ok)) {
+      console.warn(`[notify] ${delivered.filter((ok) => !ok).length}/${delivered.length} channel(s) failed for event ${event.type}`);
+    }
+    return delivered.length > 0 && delivered.every(Boolean);
+  };
+}

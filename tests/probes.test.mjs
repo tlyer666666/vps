@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import net from 'node:net';
-import { createProbeRunner } from '../server/probes.js';
+import { createProbeRunner, DEFAULT_PROBES, seedDefaultProbes } from '../server/probes.js';
 import { openStore } from '../server/store.js';
 
 function httpStub(handler) {
@@ -133,4 +133,26 @@ test('forget clears per-probe memory', async () => {
   runner.forget(probe.id);
   assert.equal(runner.stateOf(probe.id), undefined);
   runner.stop(); server.close(); store.close();
+});
+
+test('seedDefaultProbes seeds once on an empty probes table (v1.2)', () => {
+  const store = openStore(':memory:');
+  assert.equal(DEFAULT_PROBES.length >= 3, true, 'built-in preset list');
+  assert.equal(seedDefaultProbes(store), DEFAULT_PROBES.length);
+  assert.equal(store.listProbes().length, DEFAULT_PROBES.length);
+  // second boot (flag set): no duplicates, even after user deletes all probes
+  assert.equal(seedDefaultProbes(store), 0);
+  for (const p of store.listProbes()) store.deleteProbe(p.id);
+  assert.equal(seedDefaultProbes(store), 0, 'deleted defaults must not resurrect');
+  store.close();
+});
+
+test('seedDefaultProbes skips targets that already exist', () => {
+  const store = openStore(':memory:');
+  const first = DEFAULT_PROBES[0];
+  store.createProbe({ name: 'mine', type: first.type, target: first.target });
+  const added = seedDefaultProbes(store);
+  assert.equal(added, DEFAULT_PROBES.length - 1, 'existing target not duplicated');
+  assert.equal(store.listProbes().filter((p) => p.target === first.target).length, 1);
+  store.close();
 });

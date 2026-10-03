@@ -175,3 +175,46 @@ body.status-mode #main { max-width: 900px; }
 .meta-line { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 14px; font-size: 13px; }
 .checkbox-label { flex-direction: row !important; align-items: center; gap: 8px !important; }
 .checkbox-label input { width: auto; }
+
+/* ---- themes (v1.2): <html data-theme> switches the variable set ---- */
+html[data-theme='light'] {
+  --bg: #eef1f6;
+  --panel: #ffffff;
+  --panel-2: #e9eef6;
+  --border: #d3dce9;
+  --text: #1d2a44;
+  --dim: #61708c;
+  --accent: #0b6fb4;
+  --green: #14934c;
+  --amber: #b57307;
+  --red: #cc3a52;
+  --purple: #6d4fd4;
+}
+html[data-theme='midnight'] {
+  --bg: #05080f;
+  --panel: #0c1322;
+  --panel-2: #121c30;
+  --border: #1c2a47;
+  --text: #cfe0ff;
+  --dim: #64789e;
+  --accent: #61a8ff;
+}
+
+/* ---- wallpaper (v1.2): translucent frosted panels keep text readable ---- */
+body.has-wallpaper {
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+body.has-wallpaper .card,
+body.has-wallpaper table.list,
+body.has-wallpaper .modal-box,
+body.has-wallpaper .login-card,
+body.has-wallpaper form.settings,
+body.has-wallpaper .charts section {
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.spark { width: 120px; height: 28px; display: inline-block; vertical-align: middle; margin-left: 8px; }

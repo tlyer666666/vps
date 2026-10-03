@@ -116,7 +116,9 @@ export function createApp({ config, store, engine = null, notifier = null, probe
   }
 
   const agentBuckets = new Map(); // ip -> { tokens, last }
+  const publicBuckets = new Map(); // anonymous status page, separate bucket
   const loginFails = new Map(); // ip -> [ms]
+  const publicCache = { payload: null, at: 0 };
   const sseClients = new Set(); // res objects
   const sseHeartbeats = new Set(); // per-client heartbeat timers
   let broadcastTimer = null;
@@ -180,17 +182,26 @@ export function createApp({ config, store, engine = null, notifier = null, probe
   }
 
   function consumeAgentRate(ip) {
-    const rate = config.rate?.agentPerSec ?? 30;
+    return consumeBucket(agentBuckets, ip, config.rate?.agentPerSec ?? 30);
+  }
+
+  // The public status page is anonymous — keep its bucket separate from agent
+  // traffic so a crawler can never throttle real reports (and vice versa).
+  function consumePublicRate(ip) {
+    return consumeBucket(publicBuckets, ip, 5);
+  }
+
+  function consumeBucket(map, ip, rate) {
     const now = Date.now();
-    const bucket = agentBuckets.get(ip) ?? { tokens: rate, last: now };
+    const bucket = map.get(ip) ?? { tokens: rate, last: now };
     bucket.tokens = Math.min(rate, bucket.tokens + ((now - bucket.last) / 1000) * rate);
     bucket.last = now;
     if (bucket.tokens < 1) {
-      agentBuckets.set(ip, bucket);
+      map.set(ip, bucket);
       return false;
     }
     bucket.tokens -= 1;
-    agentBuckets.set(ip, bucket);
+    map.set(ip, bucket);
     return true;
   }
 
@@ -455,35 +466,45 @@ export function createApp({ config, store, engine = null, notifier = null, probe
       }
       if (req.method === 'GET' && path === '/api/public/overview') {
         // Komari-style public status page: opt-in, anonymous, sanitized.
+        // Anonymous ⇒ must never do per-request heavy work: rate limited and
+        // served from a 45s cache (review: unthrottled uptime aggregate = DoS).
         if (effective.public_status !== true) return json(res, 404, { error: 'not found' });
-        refreshUptime(true);
-        const latest = store.latestCached();
+        if (!consumePublicRate(ip)) return json(res, 429, { error: 'rate limited' });
         const now = Date.now();
-        const servers = store.listServers().map((s) => {
-          const m = latest.get(s.id) ?? null;
-          const intervalSec = s.intervalSec ?? config.intervalSec ?? 10;
-          const windowMs = Math.max(intervalSec * 3 * 1000, 60_000);
-          return {
-            id: s.id,
-            name: s.name,
-            tag: s.tag,
-            groupName: s.groupName,
-            online: m !== null && now - m.ts <= windowMs,
-            uptimePct24h: uptimeCache.get(s.id) ?? 0,
-          };
-        });
-        const latestProbes = store.latestProbeResults();
-        const probes = store.listProbes().map((p) => {
-          const l = latestProbes.get(p.id) ?? null;
-          return {
-            id: p.id, name: p.name, type: p.type, target: p.target,
-            ok: l ? l.ok === 1 : null,
-            latencyMs: l ? l.latencyMs : null,
-            error: l ? l.error : null,
-            ts: l ? l.ts : null,
-          };
-        });
-        return json(res, 200, { servers, probes });
+        if (!publicCache.payload || now - publicCache.at > 45_000) {
+          refreshUptime(true);
+          const latest = store.latestCached();
+          const servers = store.listServers().map((s) => {
+            const m = latest.get(s.id) ?? null;
+            const intervalSec = s.intervalSec ?? config.intervalSec ?? 10;
+            const windowMs = Math.max(intervalSec * 3 * 1000, 60_000);
+            return {
+              id: s.id,
+              name: s.name,
+              tag: s.tag,
+              groupName: s.groupName,
+              online: m !== null && now - m.ts <= windowMs,
+              uptimePct24h: uptimeCache.get(s.id) ?? 0,
+            };
+          });
+          const latestProbes = store.latestProbeResults();
+          const now24 = now - 24 * 3600 * 1000;
+          const probes = store.listProbes().map((p) => {
+            const l = latestProbes.get(p.id) ?? null;
+            const history = store.getProbeHistory(p.id, now24, now, 100);
+            return {
+              id: p.id, name: p.name, type: p.type, target: p.target,
+              ok: l ? l.ok === 1 : null,
+              latencyMs: l ? l.latencyMs : null,
+              error: l ? l.error : null,
+              ts: l ? l.ts : null,
+              history24h: history.points.map((pt) => ({ ts: pt.ts, latencyMs: pt.latencyMs ?? null })),
+            };
+          });
+          publicCache.payload = { servers, probes };
+          publicCache.at = now;
+        }
+        return json(res, 200, publicCache.payload);
       }
       if (!path.startsWith('/api/')) {
         // Distributable install assets so the panel one-liner works out of the box.
@@ -587,6 +608,7 @@ export function createApp({ config, store, engine = null, notifier = null, probe
           const err = settingsPatchError(body);
           if (err) return json(res, 400, { error: err });
           applySettings(body);
+          publicCache.payload = null; // settings changes invalidate the cached page
           return json(res, 200, settingsView());
         }
       }
@@ -691,6 +713,9 @@ export function createApp({ config, store, engine = null, notifier = null, probe
           const fresh = fails.filter((t) => now - t < LOGIN_WINDOW_MS);
           if (fresh.length === 0) loginFails.delete(ip);
           else loginFails.set(ip, fresh);
+        }
+        for (const [ip, bucket] of publicBuckets) {
+          if (now - bucket.last > 15 * 60_000) publicBuckets.delete(ip);
         }
       }, 30_000);
       tickTimer.unref?.();
