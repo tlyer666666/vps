@@ -201,7 +201,12 @@ sample() {
   CORES=$("$CORES_CMD" 2>/dev/null | head -n 1)
   case "$CORES" in (*[!0-9]*|'') CORES=1 ;; esac
 
-  read_cpu_counters || { CPU_TOTAL=""; CPU_IDLE=""; }
+  read_cpu_counters || { CPU_TOTAL=""; CPU_IDLE="";
+    if [ "${WARNED_NOPROC:-0}" != 1 ] && [ ! -r "$PROC/stat" ]; then
+      log "警告: $PROC/stat 不可读 —— 非 Linux 内核或挂载异常,采集指标为空,上报会被服务端拒绝"
+      WARNED_NOPROC=1
+    fi
+  }
   read_mem
   read_load
   read_uptime

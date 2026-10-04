@@ -208,8 +208,9 @@ mkdir -p "$TMP/empty-proc"
 ( export PROC="$TMP/empty-proc" STATE_FILE="$TMP/state-emptyp" DF_CMD="$TMP/fake-df"
   export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
   unset SERVER_URL TOKEN
-  bash "$AGENT" --print-payload 2>/dev/null )
+  bash "$AGENT" --print-payload 2>"$TMP/err-empty.log" )
 assert_eq "empty /proc still prints payload, exit 0" "0" "$?"
+grep -qi '不可读' "$TMP/err-empty.log" 2>/dev/null && ok "missing /proc produces a one-time diagnostic" || fail "/proc diagnostic" "$(cat "$TMP/err-empty.log" 2>/dev/null | head -2)"
 
 ( export PROC="$TMP/empty-proc" STATE_FILE="$TMP/nonexistent-dir/state" DF_CMD="$TMP/fake-df"
   export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
