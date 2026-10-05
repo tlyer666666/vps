@@ -87,6 +87,10 @@ scripts/integration-test.sh      # 端到端:真实 hub + fixture 探针(约 2 �
 node server/main.js --port 3577  # 本地起面板
 ```
 
+## 设计文档
+
+- 总体设计(架构/数据模型/接口/告警/安全/部署/测试):`docs/DESIGN.md`
+
 ## 明确不做(路线图之外的 YAGNI 清单)
 
 Web 终端/SSH、定时任务、DDNS、Docker 容器统计、多用户与 RBAC、ICMP 拨测、邮件通知、Docker 镜像分发。
