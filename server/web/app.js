@@ -788,8 +788,7 @@ if (typeof document !== 'undefined') {
     await loadOverview();
   }
 
-  // Public status page (Komari-style): no login required when the hub has
-  // 公开状态页 enabled; everything else on this page is deliberately minimal.
+  // Public status page: no login required when the hub has it enabled.
   async function renderStatus() {
     stopStream();
     $('#topbar').style.display = 'none';

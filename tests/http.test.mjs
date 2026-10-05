@@ -263,7 +263,7 @@ test('static root serves the dashboard html; unknown api is 404 JSON', async () 
   h.close();
 });
 
-test('store write failure keeps report 200 and overview alive (Review Focus #5)', async () => {
+test('store write failure keeps report 200 and overview alive', async () => {
   const h = await startApp();
   await login(h);
   const { id, token } = await (await h.call('/api/admin/servers', {
@@ -338,7 +338,7 @@ test('admin can update and delete a server', async () => {
   h.close();
 });
 
-test('admin password change rotates the credential (review finding 1)', async () => {
+test('admin password change rotates the credential', async () => {
   const h = await startApp();
   await login(h);
   const res = await h.call('/api/admin/password', {
@@ -377,7 +377,7 @@ test('password change rejects short or missing passwords', async () => {
   h.close();
 });
 
-test('password change invalidates all existing sessions (iteration 3)', async () => {
+test('password change invalidates all existing sessions', async () => {
   const h = await startApp();
   await login(h);
   // a second session (another browser) is also logged in
@@ -400,7 +400,7 @@ test('password change invalidates all existing sessions (iteration 3)', async ()
   h.close();
 });
 
-test('cross-site mutations are rejected by Origin check (iteration 3 CSRF hardening)', async () => {
+test('cross-site mutations are rejected by Origin check', async () => {
   const h = await startApp();
   await login(h);
 
@@ -436,7 +436,7 @@ test('cross-site mutations are rejected by Origin check (iteration 3 CSRF harden
   h.close();
 });
 
-test('trust-proxy takes client IP from X-Forwarded-For (review finding 3)', async () => {
+test('trust-proxy takes client IP from X-Forwarded-For', async () => {
   const store = openStore(':memory:');
   store.setAdminPasswordHash(await hashPassword(PASSWORD));
   const engine = new AlertEngine(store, {
@@ -482,7 +482,7 @@ test('without trust-proxy the XFF header is ignored (spoof-safe default)', async
   h.close();
 });
 
-test('session cookie gains Secure flag when HTTPS is detected (review finding 4)', async () => {
+test('session cookie gains Secure flag when HTTPS is detected', async () => {
   const h = await startApp();
   const res = await fetch(`${h.base}/api/login`, {
     method: 'POST',
@@ -495,7 +495,7 @@ test('session cookie gains Secure flag when HTTPS is detected (review finding 4)
   h.close();
 });
 
-// ---- iteration 1: settings/server input validation ----
+// ---- settings/server input validation ----
 
 test('PUT settings rejects type-broken payloads instead of silently killing alerts', async () => {
   const h = await startApp();
@@ -547,7 +547,7 @@ test('PUT settings accepts boundary-valid values', async () => {
   h.close();
 });
 
-test('server create/update validate field types (review finding 2)', async () => {
+test('server create/update validate field types', async () => {
   const h = await startApp();
   await login(h);
   const badBodies = [
@@ -587,7 +587,7 @@ test('server create/update validate field types (review finding 2)', async () =>
   h.close();
 });
 
-test('GET /api/admin/servers and /:id per spec §3.2 (review finding 10)', async () => {
+test('GET /api/admin/servers and /:id', async () => {
   const h = await startApp();
   await login(h);
   const { id, token } = await (await h.call('/api/admin/servers', {
@@ -604,7 +604,7 @@ test('GET /api/admin/servers and /:id per spec §3.2 (review finding 10)', async
   h.close();
 });
 
-test('events limit clamps negatives and large values (review finding 6)', async () => {
+test('events limit clamps negatives and large values', async () => {
   const h = await startApp();
   await login(h);
   for (const type of ['cpu', 'mem', 'disk']) {
@@ -619,7 +619,7 @@ test('events limit clamps negatives and large values (review finding 6)', async 
   h.close();
 });
 
-// ---- v1.1 komari features: probes, public status page, notify test ----
+// ---- probes, public status page, notify test ----
 
 function startAppWithRunner({ password = PASSWORD } = {}) {
   return startApp({ password });
@@ -755,7 +755,7 @@ test('notify-test reports per-channel delivery results', async () => {
   h.close();
 });
 
-test('public overview is cached and rate limited (iteration 4)', async () => {
+test('public overview is cached and rate limited', async () => {
   const h = await startAppWithRunner();
   await login(h);
   await h.call('/api/admin/servers', {

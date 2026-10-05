@@ -220,7 +220,7 @@ test('newToken is unique and well-formed', () => {
   assert.notEqual(a, b);
 });
 
-// ---- v1.1 komari-features: migration, probes, uptime -----------------------
+// ---- migration, probes, uptime ---------------------------------------------
 
 test('migrates an old-schema database by adding new columns', () => {
   const dir = mkdtempSync(join(tmpdir(), 'vw-migrate-'));

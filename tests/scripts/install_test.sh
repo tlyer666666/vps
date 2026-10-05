@@ -40,24 +40,24 @@ bash scripts/install-agent.sh --server http://x --token t --user no-such-user-xy
 err=$(bash scripts/install-server.sh --no-such-flag 2>&1 >/dev/null)
 [ $? -ne 0 ] && ok "unknown flag rejected (server)" || fail "unknown flag" "exit 0"
 
-# ---- 3b. server install with temp PREFIX copies trees (review finding 2) ----
+# ---- 3b. server install with temp PREFIX copies trees ----------------------
 PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12345 --password dummy123 --no-start >/dev/null 2>&1
 [ -f "$TMP/root2/opt/vpswatch/server/main.js" ] && ok "server tree installed" || fail "server tree" "missing"
 [ -f "$TMP/root2/opt/vpswatch/scripts/install-agent.sh" ] && ok "scripts tree installed" || fail "scripts tree" "missing"
 [ -f "$TMP/root2/opt/vpswatch/agent/vpswatch-agent.sh" ] && ok "agent tree installed" || fail "agent tree" "missing"
 
-# ---- 3c. reinstall (upgrade) must not nest trees (iteration 1 finding 3) -----
+# ---- 3c. reinstall (upgrade) must not nest trees ---------------------------
 PREFIX="$TMP/root2" bash scripts/install-server.sh --port 12346 --password dummy123 --no-start >/dev/null 2>&1
 [ -f "$TMP/root2/opt/vpswatch/server/main.js" ] && ok "reinstall keeps main.js top-level" || fail "reinstall" "nested server/server"
 [ ! -d "$TMP/root2/opt/vpswatch/server/server" ] && ok "reinstall does not nest server dir" || fail "reinstall nest" "server/server exists"
 
-# ---- 3d. installer rejects non-numeric interval (iteration 1 finding 4) ------
+# ---- 3d. installer rejects non-numeric interval ----------------------------
 bash scripts/install-agent.sh --server http://x --token t --interval 10s >/dev/null 2>&1
 [ $? -ne 0 ] && ok "non-numeric --interval rejected" || fail "interval validation" "accepted 10s"
 bash scripts/install-agent.sh --server http://x --token t --interval 0 >/dev/null 2>&1
 [ $? -ne 0 ] && ok "zero --interval rejected" || fail "interval validation" "accepted 0"
 
-# ---- 3e. deploy-readiness (final review findings) ---------------------------
+# ---- 3e. deploy-readiness --------------------------------------------------
 [ -d "$TMP/root2/opt/vpswatch/data" ] && ok "data dir pre-created for sandboxed boot" || fail "data dir" "missing (EROFS crash loop)"
 grep -q 'VPSWATCH_DATA_DIR' "$TMP/root2/etc/vpswatch/hub.env" && ok "hub.env pins data dir" || fail "hub.env data dir" "missing"
 [ -f "$TMP/root2/opt/vpswatch/package.json" ] && ok "package.json copied (ESM module detection)" || fail "package.json" "missing"

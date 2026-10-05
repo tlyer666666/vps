@@ -218,7 +218,7 @@ grep -qi '不可读' "$TMP/err-empty.log" 2>/dev/null && ok "missing /proc produ
   bash "$AGENT" --print-payload 2>/dev/null )
 assert_eq "unwritable state dir still prints payload, exit 0" "0" "$?"
 
-# ---- 7. corrupted state file degrades safely (iteration 1 finding 7) -------
+# ---- 7. corrupted state file degrades safely -------------------------------
 mkdir -p "$TMP/corrupt"
 printf 'prev_rx=abc\nprev_tx=\ncorruptline\nprev_cpu_total=xyz\nday=garbage\nmonth=1\n' > "$TMP/corrupt/state"
 ( export PROC="$PROC" STATE_FILE="$TMP/corrupt/state" DF_CMD="$TMP/fake-df"
@@ -234,7 +234,7 @@ fi
 assert_eq "corrupted state resets daily ledger" "0" "$(jget "$TMP/corrupt-payload.json" daily_rx)"
 assert_eq "corrupted state resets cpu to first-sample" "0" "$(jget "$TMP/corrupt-payload.json" cpu.usage_pct)"
 
-# ---- 8. INTERVAL from conf/env is clamped (iteration 1 finding 4) ----------
+# ---- 8. INTERVAL from conf/env is clamped ----------------------------------
 ( export PROC="$PROC" STATE_FILE="$TMP/state-clamp" DF_CMD="$TMP/fake-df"
   export CURL_CMD="$TMP/fake-curl-ok" DATE_CMD="$TMP/fake-date" HOSTNAME_CMD="$HOSTNM" CORES_CMD="$CORES"
   export INTERVAL=abc

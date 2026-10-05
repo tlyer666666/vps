@@ -465,9 +465,9 @@ export function createApp({ config, store, engine = null, notifier = null, probe
         return await handleLogin(req, res, ip);
       }
       if (req.method === 'GET' && path === '/api/public/overview') {
-        // Komari-style public status page: opt-in, anonymous, sanitized.
-        // Anonymous ⇒ must never do per-request heavy work: rate limited and
-        // served from a 45s cache (review: unthrottled uptime aggregate = DoS).
+        // Public status page: opt-in, anonymous, sanitized. Anonymous means
+        // it must never do per-request heavy work — rate limited and served
+        // from a 45s cache.
         if (effective.public_status !== true) return json(res, 404, { error: 'not found' });
         if (!consumePublicRate(ip)) return json(res, 429, { error: 'rate limited' });
         const now = Date.now();

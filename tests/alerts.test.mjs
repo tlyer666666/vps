@@ -175,7 +175,7 @@ test('a fresh engine (hub restart) does not re-notify an already-open event', ()
   store.close();
 });
 
-test('forget drops per-server memory when a server is deleted (iteration 2)', () => {
+test('forget drops per-server memory when a server is deleted', () => {
   const { store, engine, server } = setup();
   engine.ingest(server, metric(1000), 1000);
   assert.ok(engine.state(server.id));
