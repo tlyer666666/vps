@@ -1,0 +1,12 @@
+services:
+  vpswatch:
+    image: ghcr.io/tlyer666666/vps:latest   # 或自行 build: .
+    build: .
+    ports:
+      - "3577:3577"
+    environment:
+      - VPSWATCH_ADMIN_PASSWORD=change-me   # 首次启动生效
+      # - VPSWATCH_TRUST_PROXY=true          # 置于反代后时开启
+    volumes:
+      - ./data:/opt/vpswatch/data
+    restart: unless-stopped

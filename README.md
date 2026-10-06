@@ -84,6 +84,9 @@ node server/main.js --port 3577  # 本地起面板
 
 架构、数据模型、接口、告警、安全与部署细节见 `docs/DESIGN.md`。
 
+- 与主流同类项目对比 + 改进路线:`docs/COMPARISON.md`
+- 参与贡献(提交规范):[CONTRIBUTING.md](CONTRIBUTING.md) · 安全:[SECURITY.md](SECURITY.md) · 变更记录:[CHANGELOG.md](CHANGELOG.md)
+
 ## 明确不做
 
 Web 终端/SSH、定时任务、DDNS、Docker 容器统计、多用户与 RBAC、ICMP 拨测、邮件通知、Docker 镜像分发。
