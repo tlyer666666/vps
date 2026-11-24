@@ -1,6 +1,7 @@
 // Dial-test (probe) runner: hub-side periodic HTTP/TCP checks with latency
 // history and failure alerting. Kept dependency-free by design.
 import net from 'node:net';
+import { assertSafeUrl, assertSafeTcpTarget } from './net-guard.js';
 
 const FAIL_THRESHOLD = 3;
 const NOTIFY_COOLDOWN_MS = 10 * 60_000;
@@ -31,40 +32,44 @@ export function seedDefaultProbes(store) {
   return added;
 }
 
-function httpProbe(target, timeoutSec, fetchImpl) {
+async function httpProbe(target, timeoutSec, fetchImpl, guardOpts) {
+  const started = Date.now();
+  try {
+    await assertSafeUrl(target, guardOpts);
+  } catch (err) {
+    return { ok: false, latencyMs: Date.now() - started, error: err?.message ?? 'blocked target' };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
-  const started = Date.now();
-  return fetchImpl(target, { signal: controller.signal, redirect: 'follow' })
-    .then((res) => {
-      clearTimeout(timer);
-      const latencyMs = Date.now() - started;
-      // Any non-2xx/3xx code is a failure (5xx, 4xx, weird codes).
-      return res.status < 400
-        ? { ok: true, latencyMs }
-        : { ok: false, latencyMs, error: `HTTP ${res.status}` };
-    })
-    .catch((err) => {
-      clearTimeout(timer);
-      const latencyMs = Date.now() - started;
-      const reason = err?.name === 'AbortError' ? 'timeout' : (err?.message ?? 'error');
-      return { ok: false, latencyMs, error: reason };
-    });
+  try {
+    const res = await fetchImpl(target, { signal: controller.signal, redirect: 'manual' });
+    clearTimeout(timer);
+    res.body?.cancel?.().catch(() => {});
+    const latencyMs = Date.now() - started;
+    // Any non-2xx/3xx code is a failure (5xx, 4xx, weird codes).
+    // Redirects are not followed (SSRF protection) but 3xx proves endpoint liveness.
+    return res.status >= 200 && res.status < 400
+      ? { ok: true, latencyMs }
+      : { ok: false, latencyMs, error: `HTTP ${res.status}` };
+  } catch (err) {
+    clearTimeout(timer);
+    const latencyMs = Date.now() - started;
+    const reason = err?.name === 'AbortError' ? 'timeout' : (err?.message ?? 'error');
+    return { ok: false, latencyMs, error: reason };
+  }
 }
 
-function tcpProbe(target, timeoutSec) {
-  const sep = target.lastIndexOf(':');
-  if (sep <= 0 || sep === target.length - 1) {
-    return Promise.resolve({ ok: false, error: 'target must be host:port' });
+async function tcpProbe(target, timeoutSec, guardOpts) {
+  const started = Date.now();
+  let resolved;
+  try {
+    resolved = await assertSafeTcpTarget(target, guardOpts);
+  } catch (err) {
+    return { ok: false, latencyMs: Date.now() - started, error: err?.message ?? 'blocked target' };
   }
-  const host = target.slice(0, sep);
-  const port = Number(target.slice(sep + 1));
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    return Promise.resolve({ ok: false, error: 'invalid port' });
-  }
+  const connectHost = resolved.addresses[0] ?? resolved.host;
   return new Promise((resolve) => {
-    const started = Date.now();
-    const socket = net.connect({ host, port });
+    const socket = net.connect({ host: connectHost, port: resolved.port });
     const done = (result) => {
       const latencyMs = Date.now() - started;
       socket.destroy();
@@ -76,11 +81,12 @@ function tcpProbe(target, timeoutSec) {
   });
 }
 
-export function createProbeRunner(store, { onNotify = () => {}, log = console, fetchImpl = fetch } = {}) {
+export function createProbeRunner(store, { onNotify = () => {}, log = console, fetchImpl = fetch, allowPrivate = false, allowPrivateTargets = false, lookupImpl } = {}) {
   // probeId -> { lastRunAt, failStreak, lastNotifyAt }
   const memory = new Map();
   let timer = null;
   let running = false;
+  const guardOpts = { allowPrivate: Boolean(allowPrivate || allowPrivateTargets), ...(lookupImpl ? { lookupImpl } : {}) };
 
   async function runDue(nowMs = Date.now()) {
     if (running) return; // a slow probe batch must not stack up
@@ -94,18 +100,19 @@ export function createProbeRunner(store, { onNotify = () => {}, log = console, f
         memory.set(probe.id, st);
 
         const result = probe.type === 'tcp'
-          ? await tcpProbe(probe.target, probe.timeoutSec)
-          : await httpProbe(probe.target, probe.timeoutSec, fetchImpl);
+          ? await tcpProbe(probe.target, probe.timeoutSec, guardOpts)
+          : await httpProbe(probe.target, probe.timeoutSec, fetchImpl, guardOpts);
         store.insertProbeResult(probe.id, { ts: nowMs, ...result });
 
         if (result.ok) {
           st.failStreak = 0;
-          store.resolveEvent(probe.id, 'probe', nowMs);
+          store.resolveEvent(probe.id, 'probe', nowMs, 'probe');
         } else {
           st.failStreak += 1;
           if (st.failStreak >= FAIL_THRESHOLD) {
             const event = store.openEvent({
-              serverId: probe.id, // subject id space: probes live beside servers
+              serverId: probe.id,
+              subjectType: 'probe',
               type: 'probe',
               level: 'critical',
               message: `拨测 ${probe.name} 连续 ${st.failStreak} 次失败:${result.error ?? '失败'}`,

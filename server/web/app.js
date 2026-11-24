@@ -16,6 +16,21 @@ export function escapeHtml(s) {
     .replaceAll("'", '&#39;');
 }
 
+export function safeWallpaperUrl(raw) {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 2048) return null;
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    const href = u.href;
+    if (/["'()\\\r\n]/.test(href)) return null;
+    return href;
+  } catch {
+    return null;
+  }
+}
+
 function clampPct(p) {
   const n = Number(p);
   if (!Number.isFinite(n)) return 0;
@@ -124,9 +139,15 @@ if (typeof document !== 'undefined') {
     if (wall) {
       try {
         const parsed = JSON.parse(wall);
-        const image = parsed.url || WALLPAPERS[parsed.preset];
-        if (image) {
-          document.body.style.backgroundImage = image;
+        if (parsed.url) {
+          const safeUrl = safeWallpaperUrl(parsed.url);
+          if (safeUrl) {
+            document.body.style.backgroundImage = `url("${safeUrl}")`;
+            document.body.classList.add('has-wallpaper');
+            return;
+          }
+        } else if (WALLPAPERS[parsed.preset]) {
+          document.body.style.backgroundImage = WALLPAPERS[parsed.preset];
           document.body.classList.add('has-wallpaper');
           return;
         }
@@ -186,7 +207,14 @@ if (typeof document !== 'undefined') {
       localStorage.setItem('vw_theme', form.elements.theme.value);
       const value = presetSel.value;
       if (value === '') localStorage.removeItem('vw_wallpaper');
-      else if (value === '__custom') localStorage.setItem('vw_wallpaper', JSON.stringify({ url: urlInput.value.trim() }));
+      else if (value === '__custom') {
+        const safeUrl = safeWallpaperUrl(urlInput.value.trim());
+        if (!safeUrl) {
+          alert('请输入有效的 http(s) 图片 URL');
+          return;
+        }
+        localStorage.setItem('vw_wallpaper', JSON.stringify({ url: safeUrl }));
+      }
       else localStorage.setItem('vw_wallpaper', JSON.stringify({ preset: value }));
       applyAppearance();
       closeModal();
@@ -432,6 +460,7 @@ if (typeof document !== 'undefined') {
       <h2>修改密码</h2>
       <form id="password-form" class="settings">
         <div class="row">
+          <label>当前密码<input name="currentPassword" type="password" required></label>
           <label>新密码<input name="password" type="password" minlength="8" required></label>
           <div class="actions"><button type="submit" class="primary">更新密码</button></div>
         </div>
@@ -512,9 +541,14 @@ if (typeof document !== 'undefined') {
     });
     $('#password-form').addEventListener('submit', async (e) => {
       e.preventDefault();
+      const currentPassword = e.target.elements.currentPassword.value;
       const pw = e.target.elements.password.value;
-      const res = await api('/api/admin/password', { method: 'POST', body: JSON.stringify({ password: pw }) });
-      if (res.ok) alert('密码已更新,所有会话已注销,请重新登录'); else alert('更新失败');
+      const res = await api('/api/admin/password', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword, password: pw }),
+      });
+      if (res.ok) alert('密码已更新,所有会话已注销,请重新登录');
+      else alert('更新失败:' + ((await res.json().catch(() => ({}))).error ?? ''));
       e.target.reset();
     });
 
@@ -826,17 +860,16 @@ if (typeof document !== 'undefined') {
             </table>
             <h2>拨测</h2>
             <table class="list">
-              <thead><tr><th>名称</th><th>类型</th><th>目标</th><th>最近结果</th></tr></thead>
+              <thead><tr><th>名称</th><th>类型</th><th>最近结果</th></tr></thead>
               <tbody>
                 ${pub.probes.map((p) => `
                   <tr>
                     <td>${escapeHtml(p.name)}</td>
-                    <td><span class="tag">${p.type.toUpperCase()}</span></td>
-                    <td class="dim">${escapeHtml(p.target)}</td>
+                    <td><span class="tag">${escapeHtml(p.type.toUpperCase())}</span></td>
                     <td>${p.ok === null ? '<span class="dim">暂无</span>'
                       : p.ok ? `<span class="dot on"></span> ${p.latencyMs != null ? p.latencyMs.toFixed(0) + ' ms' : ''} ${spark(p.history24h)}`
-                        : `<span class="dot off"></span> ${escapeHtml(p.error ?? '失败')} ${spark(p.history24h)}`}</td>
-                  </tr>`).join('') || '<tr><td colspan="4" class="dim">暂无拨测任务</td></tr>'}
+                        : `<span class="dot off"></span> 异常 ${spark(p.history24h)}`}</td>
+                  </tr>`).join('') || '<tr><td colspan="3" class="dim">暂无拨测任务</td></tr>'}
               </tbody>
             </table>`
             : '<div class="empty">公开状态页未开启。管理员可在「管理 → 系统设置」中开启。</div>'}

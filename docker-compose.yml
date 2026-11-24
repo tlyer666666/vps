@@ -5,7 +5,7 @@ services:
     ports:
       - "3577:3577"
     environment:
-      - VPSWATCH_ADMIN_PASSWORD=change-me   # 首次启动生效
+      - VPSWATCH_ADMIN_PASSWORD=${VPSWATCH_ADMIN_PASSWORD:?set VPSWATCH_ADMIN_PASSWORD}   # 首次启动生效
       # - VPSWATCH_TRUST_PROXY=true          # 置于反代后时开启
     volumes:
       - ./data:/opt/vpswatch/data

@@ -13,6 +13,7 @@ const METRIC_COLS = `server_id AS serverId, ts, cpu_pct AS cpuPct,
   load1, load5, load15,
   rx_bytes AS rxBytes, tx_bytes AS txBytes, rx_speed AS rxSpeed, tx_speed AS txSpeed,
   daily_rx AS dailyRx, daily_tx AS dailyTx,
+  monthly_rx AS monthlyRx, monthly_tx AS monthlyTx,
   tcp_conns AS tcpConns, processes, uptime_sec AS uptimeSec`;
 
 const METRIC_FIELDS = [
@@ -111,6 +112,7 @@ export function openStore(dbPath) {
         CREATE TABLE IF NOT EXISTS events (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           server_id INTEGER NOT NULL,
+          subject_type TEXT NOT NULL DEFAULT 'server',
           type TEXT NOT NULL,
           level TEXT NOT NULL,
           message TEXT NOT NULL,
@@ -146,12 +148,13 @@ export function openStore(dbPath) {
         );
         CREATE INDEX IF NOT EXISTS idx_probe_results ON probe_results(probe_id, ts);
       `);
-      // v1.1 migrations for pre-existing databases (idempotent).
+      // v1.1+ migrations for pre-existing databases (idempotent).
       for (const stmt of [
         "ALTER TABLE servers ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
         'ALTER TABLE servers ADD COLUMN monthly_quota_bytes INTEGER',
         'ALTER TABLE metrics ADD COLUMN monthly_rx INTEGER',
         'ALTER TABLE metrics ADD COLUMN monthly_tx INTEGER',
+        "ALTER TABLE events ADD COLUMN subject_type TEXT NOT NULL DEFAULT 'server'",
       ]) {
         try {
           db.exec(stmt);
@@ -159,6 +162,7 @@ export function openStore(dbPath) {
           if (!/duplicate column/i.test(err.message)) throw err;
         }
       }
+      db.exec("UPDATE events SET subject_type = 'probe' WHERE type = 'probe' AND subject_type = 'server'");
     },
 
     close() {
@@ -206,7 +210,7 @@ export function openStore(dbPath) {
 
     deleteServer(id) {
       prep('DELETE FROM metrics WHERE server_id = ?').run(id);
-      prep('DELETE FROM events WHERE server_id = ?').run(id);
+      prep("DELETE FROM events WHERE server_id = ? AND subject_type = 'server'").run(id);
       prep('DELETE FROM servers WHERE id = ?').run(id);
       latestCache.delete(id);
     },
@@ -343,6 +347,7 @@ export function openStore(dbPath) {
 
     deleteProbe(id) {
       prep('DELETE FROM probe_results WHERE probe_id = ?').run(id);
+      prep("DELETE FROM events WHERE server_id = ? AND subject_type = 'probe'").run(id);
       prep('DELETE FROM probes WHERE id = ?').run(id);
     },
 
@@ -420,33 +425,40 @@ export function openStore(dbPath) {
 
     // ---- events ----
 
-    openEvent({ serverId, type, level, message }, nowMs = Date.now()) {
+    openEvent({ serverId, type, level, message, subjectType = null }, nowMs = Date.now()) {
+      const stype = subjectType ?? (type === 'probe' ? 'probe' : 'server');
       const existing = prep(
-        'SELECT id, started_at FROM events WHERE server_id = ? AND type = ? AND resolved_at IS NULL'
-      ).get(serverId, type);
+        'SELECT id, started_at FROM events WHERE server_id = ? AND subject_type = ? AND type = ? AND resolved_at IS NULL'
+      ).get(serverId, stype, type);
       if (existing) {
         return { id: existing.id, startedAt: existing.started_at, existed: true };
       }
       const res = prep(`
-        INSERT INTO events (server_id, type, level, message, started_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(serverId, type, level, message, nowMs);
+        INSERT INTO events (server_id, subject_type, type, level, message, started_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(serverId, stype, type, level, message, nowMs);
       return { id: Number(res.lastInsertRowid), startedAt: nowMs, existed: false };
     },
 
-    resolveEvent(serverId, type, nowMs = Date.now()) {
+    resolveEvent(serverId, type, nowMs = Date.now(), subjectType = null) {
+      const stype = subjectType ?? (type === 'probe' ? 'probe' : 'server');
       return prep(`
         UPDATE events SET resolved_at = ?
-        WHERE server_id = ? AND type = ? AND resolved_at IS NULL
-      `).run(nowMs, serverId, type).changes;
+        WHERE server_id = ? AND subject_type = ? AND type = ? AND resolved_at IS NULL
+      `).run(nowMs, serverId, stype, type).changes;
     },
 
-    listEvents({ limit = 100, serverId = null } = {}) {
-      const base = `SELECT id, server_id AS serverId, type, level, message,
+    listEvents({ limit = 100, serverId = null, subjectType = null } = {}) {
+      const base = `SELECT id, server_id AS serverId, subject_type AS subjectType, type, level, message,
         started_at AS startedAt, resolved_at AS resolvedAt FROM events`;
       if (serverId != null) {
-        return prep(`${base} WHERE server_id = ? ORDER BY started_at DESC, id DESC LIMIT ?`)
-          .all(serverId, limit);
+        const stype = subjectType ?? 'server';
+        return prep(`${base} WHERE server_id = ? AND subject_type = ? ORDER BY started_at DESC, id DESC LIMIT ?`)
+          .all(serverId, stype, limit);
+      }
+      if (subjectType != null) {
+        return prep(`${base} WHERE subject_type = ? ORDER BY started_at DESC, id DESC LIMIT ?`)
+          .all(subjectType, limit);
       }
       return prep(`${base} ORDER BY started_at DESC, id DESC LIMIT ?`).all(limit);
     },

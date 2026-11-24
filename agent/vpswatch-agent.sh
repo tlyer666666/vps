@@ -11,7 +11,37 @@
 set -u
 
 CONF_FILE="${VPSWATCH_CONF:-/etc/vpswatch/agent.conf}"
-[ -f "$CONF_FILE" ] && . "$CONF_FILE"
+
+strip_quotes() {
+  local s="$1"
+  s="${s%$'\r'}"
+  if [ "${#s}" -ge 2 ]; then
+    case "$s" in
+      \"*\") s="${s#\"}"; s="${s%\"}" ;;
+      \'*\') s="${s#\'}"; s="${s%\'}" ;;
+    esac
+  fi
+  printf '%s' "$s"
+}
+
+load_conf() {
+  [ -f "$CONF_FILE" ] || return 0
+  local k v
+  while IFS='=' read -r k v || [ -n "$k" ]; do
+    k="${k%$'\r'}"
+    case "$k" in (''|\#*) continue ;; esac
+    v="$(strip_quotes "$v")"
+    case "$k" in
+      SERVER_URL) SERVER_URL="$v" ;;
+      TOKEN)      TOKEN="$v" ;;
+      INTERVAL)   INTERVAL="$v" ;;
+      STATE_FILE) STATE_FILE="$v" ;;
+      MOUNTS)     MOUNTS="$v" ;;
+    esac
+  done < "$CONF_FILE"
+}
+
+load_conf
 
 SERVER_URL="${SERVER_URL:-}"
 TOKEN="${TOKEN:-}"
@@ -26,7 +56,7 @@ DF_CMD="${DF_CMD:-df}"
 CURL_CMD="${CURL_CMD:-curl}"
 DATE_CMD="${DATE_CMD:-date}"
 HOSTNAME_CMD="${HOSTNAME_CMD:-hostname}"
-CORES_CMD="${CORES_CMD:-getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1}"
+CORES_CMD="${CORES_CMD:-}"
 MOUNTS="${MOUNTS:-}"
 VERSION="${AGENT_VERSION:-1.0.0}"
 
@@ -35,8 +65,33 @@ MODE="${1:-loop}"
 log() { echo "vpswatch-agent: $*" >&2; }
 
 die_config() {
-  log "SERVER_URL and TOKEN must be set (env or $CONF_FILE)"
+  log "${1:-SERVER_URL and TOKEN must be set (env or $CONF_FILE)}"
   exit 1
+}
+
+validate_config() {
+  [ -n "$SERVER_URL" ] && [ -n "$TOKEN" ] || die_config
+  SERVER_URL="${SERVER_URL%/}"
+  local url_re='^https?://[][A-Za-z0-9._:@/-]+$'
+  local tok_re='^[A-Za-z0-9._-]+$'
+  if ! [[ "$SERVER_URL" =~ $url_re ]]; then
+    die_config "invalid SERVER_URL: must be http(s):// without whitespace or shell metacharacters"
+  fi
+  if ! [[ "$TOKEN" =~ $tok_re ]]; then
+    die_config "invalid TOKEN: contains disallowed characters"
+  fi
+}
+
+get_cores() {
+  local c=""
+  if [ -n "$CORES_CMD" ]; then
+    c=$("$CORES_CMD" 2>/dev/null | head -n 1)
+  else
+    c=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)
+  fi
+  case "$c" in (*[!0-9]*|'') c=1 ;; esac
+  [ "$c" -ge 1 ] 2>/dev/null || c=1
+  printf '%s' "$c"
 }
 
 # ---- collectors ------------------------------------------------------------
@@ -141,8 +196,23 @@ load_state() {
   prev_cpu_total=""; prev_cpu_idle=""; prev_rx=""; prev_tx=""
   day=""; daily_rx=0; daily_tx=0; month=""; monthly_rx=0; monthly_tx=0
   if [ -f "$STATE_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$STATE_FILE"
+    local k v
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+      k="${k%$'\r'}"
+      v="${v%$'\r'}"
+      case "$k" in
+        prev_cpu_total) prev_cpu_total="$v" ;;
+        prev_cpu_idle)  prev_cpu_idle="$v" ;;
+        prev_rx)        prev_rx="$v" ;;
+        prev_tx)        prev_tx="$v" ;;
+        day)            day="$v" ;;
+        daily_rx)       daily_rx="$v" ;;
+        daily_tx)       daily_tx="$v" ;;
+        month)          month="$v" ;;
+        monthly_rx)     monthly_rx="$v" ;;
+        monthly_tx)     monthly_tx="$v" ;;
+      esac
+    done < "$STATE_FILE"
     # A hand-edited or corrupt state file must degrade to first-sample
     # behavior, never feed garbage into arithmetic (crash loop under set -u).
     case "$prev_cpu_total" in (*[!0-9]*|'') prev_cpu_total="" ;; esac
@@ -198,8 +268,7 @@ sample() {
 
   HOSTNAME_OUT=$("$HOSTNAME_CMD" 2>/dev/null | head -n 1)
   case "$HOSTNAME_OUT" in (*[!A-Za-z0-9._-]*) HOSTNAME_OUT="" ;; esac
-  CORES=$("$CORES_CMD" 2>/dev/null | head -n 1)
-  case "$CORES" in (*[!0-9]*|'') CORES=1 ;; esac
+  CORES=$(get_cores)
 
   read_cpu_counters || { CPU_TOTAL=""; CPU_IDLE="";
     if [ "${WARNED_NOPROC:-0}" != 1 ] && [ ! -r "$PROC/stat" ]; then
@@ -246,9 +315,9 @@ sample() {
 build_json() {
   local swap_pair="" load_pair="" host_pair=""
   [ -n "$SWAP_TOTAL" ] && swap_pair="\"swap_total\":$SWAP_TOTAL,\"swap_used\":${SWAP_USED:-0},"
-  [ -n "${LOAD1:-}" ] && load_pair=",\"load1\":${LOAD1:-0},\"load5\":${LOAD5:-0},\"load15\":${LOAD15:-0}"
+  [ -n "${LOAD1:-}" ] && load_pair="\"load\":{\"load1\":${LOAD1:-0},\"load5\":${LOAD5:-0},\"load15\":${LOAD15:-0}},"
   [ -n "$HOSTNAME_OUT" ] && host_pair="\"hostname\":\"$HOSTNAME_OUT\","
-  printf '{%s"version":"%s","uptime":%s,"cpu":{"usage_pct":%s,"cores":%s%s},"mem":{%s"total":%s,"used":%s},"disks":%s,"net":{"rx_bytes":%s,"tx_bytes":%s},"daily_rx":%s,"daily_tx":%s,"monthly_rx":%s,"monthly_tx":%s,"tcp_conns":%s,"processes":%s,"ts":%s}' \
+  printf '{%s"version":"%s","uptime":%s,"cpu":{"usage_pct":%s,"cores":%s},%s"mem":{%s"total":%s,"used":%s},"disks":%s,"net":{"rx_bytes":%s,"tx_bytes":%s},"daily_rx":%s,"daily_tx":%s,"monthly_rx":%s,"monthly_tx":%s,"tcp_conns":%s,"processes":%s,"ts":%s}' \
     "$host_pair" "$VERSION" "${UPTIME:-0}" "$CPU_PCT" "$CORES" "$load_pair" \
     "$swap_pair" "${MEM_TOTAL:-0}" "${MEM_USED:-0}" \
     "$DISKS_JSON" "$NET_RX" "$NET_TX" \
@@ -273,7 +342,7 @@ case "$MODE" in
     build_json
     ;;
   --once)
-    [ -n "$SERVER_URL" ] && [ -n "$TOKEN" ] || die_config
+    validate_config
     sample
     if report "$(build_json)"; then
       exit 0
@@ -282,7 +351,7 @@ case "$MODE" in
     exit 2
     ;;
   *)
-    [ -n "$SERVER_URL" ] && [ -n "$TOKEN" ] || die_config
+    validate_config
     log "starting: reporting to $SERVER_URL every ${INTERVAL}s"
     while :; do
       sample

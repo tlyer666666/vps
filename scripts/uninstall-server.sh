@@ -5,6 +5,7 @@ set -u
 
 PREFIX="${PREFIX:-}"
 APP_DIR="${PREFIX}/opt/vpswatch"
+DATA_DIR="${PREFIX}/var/lib/vpswatch"
 CONF="${PREFIX}/etc/vpswatch/hub.env"
 UNIT="${PREFIX}/etc/systemd/system/vpswatch.service"
 PURGE_DATA=0
@@ -31,9 +32,9 @@ rm -f "$CONF"
 rmdir "${PREFIX}/etc/vpswatch" 2>/dev/null
 
 if [ "$PURGE_DATA" -eq 1 ]; then
-  rm -rf "${PREFIX}/var/lib/vpswatch"
+  rm -rf "$DATA_DIR"
   echo "data directory removed (--purge-data)"
 else
-  echo "数据目录 ${PREFIX}/var/lib/vpswatch 已保留(含拨测/流量数据);确认不需要可再次运行加 --purge-data"
+  echo "数据目录 $DATA_DIR 已保留(含拨测/流量数据);确认不需要可再次运行加 --purge-data"
 fi
 echo "vpswatch hub removed."

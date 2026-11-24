@@ -318,3 +318,29 @@ test('getUptimeAll computes per-server uptime in one query', () => {
   assert.equal(map.get(b.id), 10, '1 of 10 expected samples (60s interval, 600s window) = 10%');
   s.close();
 });
+
+test('events are isolated between servers and probes sharing the same numeric id', () => {
+  const s = freshStore();
+  const srv = s.createServer({ name: 'srv-1' });
+  const probe = s.createProbe({ name: 'probe-1', type: 'http', target: 'https://example.com/' });
+  assert.equal(srv.id, probe.id, 'server and probe share numeric id 1');
+
+  s.openEvent({ serverId: srv.id, subjectType: 'server', type: 'cpu', level: 'critical', message: 'high cpu' }, 1000);
+  s.openEvent({ serverId: probe.id, subjectType: 'probe', type: 'probe', level: 'critical', message: 'probe down' }, 2000);
+
+  assert.equal(s.listEvents({ serverId: srv.id, subjectType: 'server' }).length, 1);
+  assert.equal(s.listEvents({ serverId: probe.id, subjectType: 'probe' }).length, 1);
+
+  // deleteServer must only delete server events, leaving probe events intact
+  s.deleteServer(srv.id);
+  assert.equal(s.listEvents({ serverId: srv.id, subjectType: 'server' }).length, 0);
+  const remaining = s.listEvents({ subjectType: 'probe' });
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].message, 'probe down');
+
+  // deleteProbe must clean up probe events
+  s.deleteProbe(probe.id);
+  assert.equal(s.listEvents({ subjectType: 'probe' }).length, 0);
+  assert.equal(s.listEvents().length, 0);
+  s.close();
+});

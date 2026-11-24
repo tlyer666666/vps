@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // VPSWatch hub entry point: config -> store -> engine -> http.
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { loadConfig, deepMerge } from './config.js';
+import { loadConfig, resolveSettings } from './config.js';
 import { openStore } from './store.js';
 import { hashPassword } from './auth.js';
 import { AlertEngine } from './alerts.js';
@@ -24,25 +24,45 @@ if (!store.getAdminPasswordHash()) {
   }
 }
 
-const saved = store.getSetting('settings', {}) ?? {};
-const thresholds = deepMerge(config.thresholds ?? {}, saved.thresholds ?? {});
-const notifyCooldownMin = saved.notifyCooldownMin ?? config.notifyCooldownMin;
+// Once the password hash is safely stored in SQLite, scrub any plaintext
+// VPSWATCH_ADMIN_PASSWORD line from hub.env if configured via VPSWATCH_ENV_FILE.
+if (store.getAdminPasswordHash() && process.env.VPSWATCH_ENV_FILE) {
+  try {
+    const envPath = process.env.VPSWATCH_ENV_FILE;
+    const raw = readFileSync(envPath, 'utf8');
+    if (/^\s*VPSWATCH_ADMIN_PASSWORD=/m.test(raw)) {
+      const cleaned = raw
+        .split('\n')
+        .filter((line) => !/^\s*VPSWATCH_ADMIN_PASSWORD=/.test(line))
+        .join('\n');
+      writeFileSync(envPath, cleaned, { mode: 0o600 });
+    }
+  } catch { /* read-only filesystem or non-writable env file is non-fatal */ }
+}
 
-const notifier = createNotifier({ webhookUrl: () => store.getSetting('settings', {})?.webhookUrl ?? '' });
+const getSettings = () => resolveSettings(config, store.getSetting('settings', {}) ?? {});
+const initialSettings = getSettings();
+// Opt-in server-side env only (never exposed in settings API) for LAN/test targets.
+const allowPrivateTargets = /^(1|true|yes)$/i.test(process.env.VPSWATCH_ALLOW_PRIVATE_TARGETS ?? '');
+
+const notifier = createNotifier({
+  webhookUrl: () => getSettings().webhookUrl,
+  allowPrivateTargets,
+});
 
 // Every alert channel fires in parallel; one dead channel or a failing
 // settings read never crashes the hub (createDispatch catches everything).
-const dispatch = createDispatch({ store, notifier, sendTelegram });
+const dispatch = createDispatch({ store, config, getSettings, notifier, sendTelegram });
 
 const engine = new AlertEngine(store, {
-  thresholds,
-  notifyCooldownMin,
+  thresholds: { ...initialSettings.thresholds },
+  notifyCooldownMin: initialSettings.notifyCooldownMin,
   onNotify: dispatch,
 });
 
-const probeRunner = createProbeRunner(store, { onNotify: dispatch });
+const probeRunner = createProbeRunner(store, { onNotify: dispatch, allowPrivateTargets });
 
-const app = createApp({ config, store, engine, probeRunner, log: console });
+const app = createApp({ config, store, engine, notifier, probeRunner, allowPrivateTargets, log: console });
 app.boot();
 seedDefaultProbes(store); // first boot: built-in dial-test presets
 probeRunner.start();

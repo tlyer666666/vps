@@ -13,7 +13,8 @@ usage() {
 SERVER_URL=""
 TOKEN=""
 INTERVAL="10"
-RUN_USER="root"
+RUN_USER="vpswatch"
+USER_EXPLICIT=0
 NO_START=0
 MODE="install"
 
@@ -22,7 +23,7 @@ while [ $# -gt 0 ]; do
     --server) SERVER_URL="${2:-}"; shift 2 ;;
     --token)  TOKEN="${2:-}"; shift 2 ;;
     --interval) INTERVAL="${2:-10}"; shift 2 ;;
-    --user) RUN_USER="${2:-root}"; shift 2 ;;
+    --user) RUN_USER="${2:-vpswatch}"; USER_EXPLICIT=1; shift 2 ;;
     --no-start) NO_START=1; shift ;;
     --uninstall) MODE="uninstall"; shift ;;
     --print-unit) MODE="print-unit"; shift ;;
@@ -104,10 +105,34 @@ fi
 
 [ -n "$SERVER_URL" ] || { echo "error: --server is required" >&2; usage; exit 1; }
 [ -n "$TOKEN" ] || { echo "error: --token is required" >&2; usage; exit 1; }
+SERVER_URL="${SERVER_URL%/}"
+url_re='^https?://[][A-Za-z0-9._:@/-]+$'
+tok_re='^[A-Za-z0-9._-]+$'
+if ! [[ "$SERVER_URL" =~ $url_re ]]; then
+  echo "error: --server must be a valid http(s) URL without whitespace or shell metacharacters" >&2
+  usage; exit 1
+fi
+if ! [[ "$TOKEN" =~ $tok_re ]]; then
+  echo "error: --token contains disallowed characters" >&2
+  usage; exit 1
+fi
 case "$INTERVAL" in (*[!0-9]*|'') echo "error: --interval must be a positive integer (seconds)" >&2; usage; exit 1 ;; esac
 [ "$INTERVAL" -ge 1 ] || { echo "error: --interval must be >= 1" >&2; usage; exit 1; }
+if ! [[ "$RUN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  echo "error: invalid --user '$RUN_USER'" >&2
+  usage; exit 1
+fi
 if [ "$RUN_USER" != "root" ]; then
-  id -u "$RUN_USER" >/dev/null 2>&1 || { echo "error: user '$RUN_USER' does not exist" >&2; usage; exit 1; }
+  if ! id -u "$RUN_USER" >/dev/null 2>&1; then
+    if [ "$USER_EXPLICIT" -eq 0 ] && [ "$RUN_USER" = "vpswatch" ] && [ -z "$PREFIX" ] && [ "$(id -u)" = "0" ]; then
+      useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER" 2>/dev/null \
+        || useradd -r -M -s /sbin/nologin "$RUN_USER" 2>/dev/null \
+        || adduser --system --no-create-home --disabled-login "$RUN_USER" 2>/dev/null \
+        || { echo "error: failed to create system user '$RUN_USER'" >&2; exit 1; }
+    elif [ "$USER_EXPLICIT" -eq 1 ] || [ -z "$PREFIX" ]; then
+      echo "error: user '$RUN_USER' does not exist" >&2; usage; exit 1
+    fi
+  fi
 fi
 
 echo "installing vpswatch agent..."

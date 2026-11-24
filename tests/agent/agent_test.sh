@@ -138,7 +138,10 @@ assert_eq "cpu.usage_pct first run" "0"  "$(jget "$TMP/p1.json" cpu.usage_pct)"
 assert_eq "mem.total bytes"  "4096000000"   "$(jget "$TMP/p1.json" mem.total)"       # 4000000 kB * 1024
 assert_eq "mem.used bytes"   "3072000000"   "$(jget "$TMP/p1.json" mem.used)"        # 4000000-1000000 avail
 assert_eq "mem.swap_used"    "512000000"    "$(jget "$TMP/p1.json" mem.swap_used)"   # 2000000-1500000
-assert_eq "load1"            "0.1"          "$(jget "$TMP/p1.json" cpu.load1)"
+assert_eq "load.load1"       "0.1"          "$(jget "$TMP/p1.json" load.load1)"
+assert_eq "load.load5"       "0.2"          "$(jget "$TMP/p1.json" load.load5)"
+assert_eq "load.load15"      "0.3"          "$(jget "$TMP/p1.json" load.load15)"
+assert_eq "cpu.load1 absent" "undefined"    "$(jget "$TMP/p1.json" cpu.load1)"
 assert_eq "net.rx_bytes"     "5000"         "$(jget "$TMP/p1.json" net.rx_bytes)"
 assert_eq "net.tx_bytes"     "3000"         "$(jget "$TMP/p1.json" net.tx_bytes)"
 assert_eq "tcp_conns"        "1"            "$(jget "$TMP/p1.json" tcp_conns)"

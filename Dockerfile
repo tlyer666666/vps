@@ -6,6 +6,8 @@ ENV NODE_ENV=production
 
 COPY package.json ./
 COPY server ./server
+COPY scripts ./scripts
+COPY agent ./agent
 
 # 数据目录(挂载卷以持久化 SQLite 数据库)
 RUN mkdir -p /opt/vpswatch/data && chown -R node:node /opt/vpswatch

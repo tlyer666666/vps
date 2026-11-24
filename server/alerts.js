@@ -36,7 +36,7 @@ export class AlertEngine {
     const st = this.#stateFor(serverRow.id, serverRow.intervalSec);
     st.lastSeen = nowMs;
     st.intervalSec = serverRow.intervalSec ?? st.intervalSec;
-    this.#resolve(serverRow.id, 'offline');
+    this.#resolve(serverRow.id, 'offline', nowMs);
 
     this.#consecutiveRule(serverRow, st, 'cpu', metric.cpuPct ?? 0, nowMs);
     const memPct = metric.memTotal > 0 ? ((metric.memUsed ?? 0) / metric.memTotal) * 100 : 0;
@@ -47,7 +47,7 @@ export class AlertEngine {
       this.#open(serverRow, st, 'disk', 'critical',
         `${serverRow.name} ${LABELS.disk} ${diskPct.toFixed(1)}%(阈值 ${this.thresholds.disk}%)`, nowMs);
     } else {
-      this.#resolve(serverRow.id, 'disk');
+      this.#resolve(serverRow.id, 'disk', nowMs);
     }
   }
 
@@ -83,8 +83,18 @@ export class AlertEngine {
   }
 
   tick(nowMs = Date.now()) {
+    const latest = this.store.latestCached?.() ?? new Map();
     for (const server of this.store.listServers()) {
       const st = this.#stateFor(server.id, server.intervalSec);
+      st.intervalSec = server.intervalSec ?? st.intervalSec;
+      // After a hub restart, in-memory states are empty — hydrate lastSeen from
+      // the persisted latest metric so a silent server is still detected offline.
+      if (st.lastSeen === null) {
+        const lastMetric = latest.get(server.id);
+        if (lastMetric && typeof lastMetric.ts === 'number') {
+          st.lastSeen = lastMetric.ts;
+        }
+      }
       if (st.lastSeen !== null) {
         const windowMs = Math.max((st.intervalSec ?? 10) * 3 * 1000, 60_000);
         if (nowMs - st.lastSeen > windowMs) {

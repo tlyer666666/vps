@@ -15,6 +15,13 @@ const MIME = {
   '.sh': 'text/x-shellscript; charset=utf-8',
 };
 
+export const SECURITY_HEADERS = {
+  'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+  'x-frame-options': 'DENY',
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+};
+
 // Returns true when the file was served; false lets the caller answer 404.
 export function serveStatic(webDir, urlPath, res) {
   let p;
@@ -29,6 +36,7 @@ export function serveStatic(webDir, urlPath, res) {
   if (!full.startsWith(root)) return false; // path traversal
   if (!existsSync(full) || !statSync(full).isFile()) return false;
   res.writeHead(200, {
+    ...SECURITY_HEADERS,
     'content-type': MIME[extname(full).toLowerCase()] ?? 'application/octet-stream',
     'cache-control': 'no-cache',
   });

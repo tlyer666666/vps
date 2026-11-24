@@ -68,7 +68,7 @@ agent_report() { # proc_dir token
 make_proc "$TMP/procA" 5000 3000 1000000
 make_proc "$TMP/procB" 8000 9000 2000000
 
-node server/main.js --port "$PORT" --db-path "$TMP/data.db" --data-dir "$TMP" \
+VPSWATCH_ALLOW_PRIVATE_TARGETS=true node server/main.js --port "$PORT" --db-path "$TMP/data.db" --data-dir "$TMP" \
   --admin-password testpw >"$TMP/hub.log" 2>&1 &
 HUB_PID=$!
 
@@ -195,7 +195,7 @@ ok "offline alert fires after silence"
 
 # ---------- scene 9: restart persistence ---------------------------------------
 kill "$HUB_PID" 2>/dev/null; wait "$HUB_PID" 2>/dev/null
-node server/main.js --port "$PORT" --db-path "$TMP/data.db" --data-dir "$TMP" \
+VPSWATCH_ALLOW_PRIVATE_TARGETS=true node server/main.js --port "$PORT" --db-path "$TMP/data.db" --data-dir "$TMP" \
   --admin-password testpw >>"$TMP/hub.log" 2>&1 &
 HUB_PID=$!
 ready=1

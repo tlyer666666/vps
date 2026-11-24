@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { createApp } from '../server/http.js';
 import { openStore } from '../server/store.js';
 import { AlertEngine } from '../server/alerts.js';
@@ -8,8 +9,15 @@ import { hashPassword } from '../server/auth.js';
 
 const PORT = 0;
 const PASSWORD = 'test-passwd';
+const PUBLIC_LOOKUP = async () => [{ address: '93.184.216.34', family: 4 }];
 
-async function startApp({ password = PASSWORD } = {}) {
+async function startApp(t, {
+  password = PASSWORD,
+  trustProxy = false,
+  allowPrivateTargets = false,
+  sendTelegramImpl = undefined,
+  lookupImpl = PUBLIC_LOOKUP,
+} = {}) {
   const store = openStore(':memory:');
   if (password !== null) {
     store.setAdminPasswordHash(await hashPassword(password));
@@ -21,19 +29,32 @@ async function startApp({ password = PASSWORD } = {}) {
     onNotify: (event, server) => notified.push(event),
   });
   const probeRunner = createProbeRunner(store, {
+    allowPrivateTargets,
     onNotify: (event, probe) => notified.push(event),
   });
   const app = createApp({
-    config: { intervalSec: 10, retentionDays: 30, rate: { agentPerSec: 30, loginPer15Min: 5 } },
+    config: { trustProxy, intervalSec: 10, retentionDays: 30, rate: { agentPerSec: 30, loginPer15Min: 5 } },
     store,
     engine,
     probeRunner,
+    ...(sendTelegramImpl ? { sendTelegramImpl } : {}),
+    lookupImpl,
+    allowPrivateTargets,
     log: { info: () => {}, warn: () => {}, error: () => {} },
   });
   const server = app.listen(PORT, '127.0.0.1');
   await new Promise((res) => server.once('listening', res));
   const base = `http://127.0.0.1:${server.address().port}`;
   let cookie = null;
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    probeRunner.stop();
+    app.close();
+    store.close();
+  };
+  if (t?.after) t.after(close);
   const call = async (path, opts = {}) => {
     const res = await fetch(base + path, {
       ...opts,
@@ -43,7 +64,7 @@ async function startApp({ password = PASSWORD } = {}) {
     if (setc) cookie = setc.split(';')[0];
     return res;
   };
-  return { store, engine, notified, app, server, base, call, close: () => app.close() };
+  return { store, engine, notified, app, server, base, call, close };
 }
 
 async function login(h) {
@@ -77,18 +98,17 @@ function reportBody(over = {}) {
   };
 }
 
-test('unauthenticated /api returns 401 JSON', async () => {
-  const h = await startApp();
+test('unauthenticated /api returns 401 JSON', async (t) => {
+  const h = await startApp(t);
   for (const path of ['/api/overview', '/api/events', '/api/admin/settings']) {
     const res = await h.call(path);
     assert.equal(res.status, 401, path);
     assert.deepEqual(await res.json(), { error: 'unauthorized' });
   }
-  h.close();
 });
 
-test('login sets session cookie; wrong password hits 429 on 6th try', async () => {
-  const h = await startApp();
+test('login sets session cookie; wrong password hits 429 on 6th try', async (t) => {
+  const h = await startApp(t);
   for (let i = 0; i < 5; i++) {
     const res = await h.call('/api/login', {
       method: 'POST',
@@ -103,20 +123,18 @@ test('login sets session cookie; wrong password hits 429 on 6th try', async () =
     body: JSON.stringify({ password: 'wrong' }),
   });
   assert.equal(sixth.status, 429);
-  h.close();
 });
 
-test('login flow grants access to overview', async () => {
-  const h = await startApp();
+test('login flow grants access to overview', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const res = await h.call('/api/overview');
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), []);
-  h.close();
 });
 
-test('full report pipeline: admin creates server, agent reports, overview shows online', async () => {
-  const h = await startApp();
+test('full report pipeline: admin creates server, agent reports, overview shows online', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const createRes = await h.call('/api/admin/servers', {
     method: 'POST',
@@ -145,11 +163,10 @@ test('full report pipeline: admin creates server, agent reports, overview shows 
   assert.equal(item.metric.cpuPct, 20);
   assert.equal(item.metric.rxSpeed > 0, true, 'second and later reports derive speed from counters');
   assert.equal(item.metric.diskPct, 25);
-  h.close();
 });
 
-test('bad token is 401; reset-token revokes the old one immediately', async () => {
-  const h = await startApp();
+test('bad token is 401; reset-token revokes the old one immediately', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { id, token } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -165,11 +182,10 @@ test('bad token is 401; reset-token revokes the old one immediately', async () =
   const { token: fresh } = await reset.json();
   assert.equal((await report(h, token, reportBody())).status, 401, 'old token must die');
   assert.equal((await report(h, fresh, reportBody())).status, 200);
-  h.close();
 });
 
-test('invalid report payloads are 400 and stored nothing', async () => {
-  const h = await startApp();
+test('invalid report payloads are 400 and stored nothing', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { token } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -185,11 +201,10 @@ test('invalid report payloads are 400 and stored nothing', async () => {
   });
   assert.equal(bad.status, 400);
   assert.equal(h.store.listEvents({ limit: 10 }).length, 0);
-  h.close();
 });
 
-test('oversized body is 413', async () => {
-  const h = await startApp();
+test('oversized body is 413', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { token } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -202,11 +217,10 @@ test('oversized body is 413', async () => {
     body: 'x'.repeat(65 * 1024),
   });
   assert.equal(big.status, 413);
-  h.close();
 });
 
-test('history endpoint returns points from metrics', async () => {
-  const h = await startApp();
+test('history endpoint returns points from metrics', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { id } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -224,11 +238,10 @@ test('history endpoint returns points from metrics', async () => {
   assert.equal(hist.downsampled, false);
   assert.equal(hist.points.length, 5);
   assert.equal(hist.points[4].cpuPct, 14);
-  h.close();
 });
 
-test('SSE stream sends an initial overview frame', async () => {
-  const h = await startApp();
+test('SSE stream sends an initial overview frame', async (t) => {
+  const h = await startApp(t);
   await login(h);
   await h.call('/api/admin/servers', {
     method: 'POST',
@@ -243,11 +256,10 @@ test('SSE stream sends an initial overview frame', async () => {
   assert.match(text, /event: overview/);
   assert.match(text, /"name":"a"/);
   await reader.cancel().catch(() => {});
-  h.close();
 });
 
-test('static root serves the dashboard html; unknown api is 404 JSON', async () => {
-  const h = await startApp();
+test('static root serves the dashboard html; unknown api is 404 JSON', async (t) => {
+  const h = await startApp(t);
   await login(h); // unknown-api 404 applies to authed callers; unauthenticated gets 401
   const home = await h.call('/');
   assert.equal(home.status, 200);
@@ -260,11 +272,10 @@ test('static root serves the dashboard html; unknown api is 404 JSON', async () 
   const unknownApi = await h.call('/api/nothing');
   assert.equal(unknownApi.status, 404);
   assert.deepEqual(await unknownApi.json(), { error: 'not found' });
-  h.close();
 });
 
-test('store write failure keeps report 200 and overview alive', async () => {
-  const h = await startApp();
+test('store write failure keeps report 200 and overview alive', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { id, token } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -279,11 +290,10 @@ test('store write failure keeps report 200 and overview alive', async () => {
   assert.equal(overview.length, 1);
   assert.equal(overview[0].online, false, 'persist failed, so no metric backs the server row');
   assert.equal(overview[0].metric, null);
-  h.close();
 });
 
-test('admin settings GET/PUT round-trips and updates engine thresholds', async () => {
-  const h = await startApp();
+test('admin settings GET/PUT round-trips and updates engine thresholds', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const initial = await (await h.call('/api/admin/settings')).json();
   assert.equal(initial.thresholds.cpu, 90);
@@ -303,20 +313,18 @@ test('admin settings GET/PUT round-trips and updates engine thresholds', async (
 
   const events = await (await h.call('/api/events?limit=10')).json();
   assert.deepEqual(events, []);
-  h.close();
 });
 
-test('logout invalidates the session cookie', async () => {
-  const h = await startApp();
+test('logout invalidates the session cookie', async (t) => {
+  const h = await startApp(t);
   await login(h);
   assert.equal((await h.call('/api/overview')).status, 200);
   await h.call('/api/logout', { method: 'POST' });
   assert.equal((await h.call('/api/overview')).status, 401);
-  h.close();
 });
 
-test('admin can update and delete a server', async () => {
-  const h = await startApp();
+test('admin can update and delete a server', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { id } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -335,16 +343,15 @@ test('admin can update and delete a server', async () => {
 
   assert.equal((await h.call(`/api/admin/servers/${id}`, { method: 'DELETE' })).status, 200);
   assert.deepEqual(await (await h.call('/api/overview')).json(), []);
-  h.close();
 });
 
-test('admin password change rotates the credential', async () => {
-  const h = await startApp();
+test('admin password change rotates the credential', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const res = await h.call('/api/admin/password', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ password: 'brand-new-pw' }),
+    body: JSON.stringify({ currentPassword: PASSWORD, password: 'brand-new-pw' }),
   });
   assert.equal(res.status, 200);
 
@@ -362,23 +369,54 @@ test('admin password change rotates the credential', async () => {
     body: JSON.stringify({ password: 'brand-new-pw' }),
   });
   assert.equal(newTry.status, 200, 'new password must log in');
-  h.close();
 });
 
-test('password change rejects short or missing passwords', async () => {
-  const h = await startApp();
+test('password change rejects missing or wrong currentPassword', async (t) => {
+  const h = await startApp(t);
+  await login(h);
+  const missing = await h.call('/api/admin/password', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'brand-new-pw' }),
+  });
+  assert.equal(missing.status, 403, 'missing currentPassword must be rejected');
+
+  const wrong = await h.call('/api/admin/password', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ currentPassword: 'wrong-password', password: 'brand-new-pw' }),
+  });
+  assert.equal(wrong.status, 403, 'wrong currentPassword must be rejected');
+
+  // original session and original password must still be intact
+  assert.equal((await h.call('/api/overview')).status, 200);
+  const reLogin = await fetch(`${h.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  assert.equal(reLogin.status, 200);
+});
+
+test('password change rejects short or missing passwords', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const short = await h.call('/api/admin/password', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ password: 'short' }),
+    body: JSON.stringify({ currentPassword: PASSWORD, password: 'short' }),
   });
   assert.equal(short.status, 400);
-  h.close();
+  const empty = await h.call('/api/admin/password', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ currentPassword: PASSWORD }),
+  });
+  assert.equal(empty.status, 400);
 });
 
-test('password change invalidates all existing sessions', async () => {
-  const h = await startApp();
+test('password change invalidates all existing sessions', async (t) => {
+  const h = await startApp(t);
   await login(h);
   // a second session (another browser) is also logged in
   const cookie2 = await fetch(`${h.base}/api/login`, {
@@ -387,21 +425,21 @@ test('password change invalidates all existing sessions', async () => {
     body: JSON.stringify({ password: PASSWORD }),
   }).then((r) => r.headers.get('set-cookie').split(';')[0]);
 
-  await h.call('/api/admin/password', {
+  const change = await h.call('/api/admin/password', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ password: 'brand-new-pw' }),
+    body: JSON.stringify({ currentPassword: PASSWORD, password: 'brand-new-pw' }),
   });
+  assert.equal(change.status, 200);
 
   const stolen = await fetch(`${h.base}/api/overview`, { headers: { cookie: cookie2 } });
   assert.equal(stolen.status, 401, 'rotating the password must kill every session');
   const own = await h.call('/api/overview');
   assert.equal(own.status, 401, 'current session is invalidated too');
-  h.close();
 });
 
-test('cross-site mutations are rejected by Origin check', async () => {
-  const h = await startApp();
+test('cross-site mutations are rejected by Origin check', async (t) => {
+  const h = await startApp(t);
   await login(h);
 
   // stolen-but-valid session cookie + cross-site Origin → 403
@@ -417,7 +455,7 @@ test('cross-site mutations are rejected by Origin check', async () => {
       origin: 'https://evil.example',
       cookie: cookie2,
     },
-    body: JSON.stringify({ password: 'hijacked-pw1' }),
+    body: JSON.stringify({ currentPassword: PASSWORD, password: 'hijacked-pw1' }),
   });
   assert.equal(evil.status, 403, 'cross-origin mutation must be 403 even with a stolen session');
 
@@ -433,10 +471,9 @@ test('cross-site mutations are rejected by Origin check', async () => {
   assert.equal(same.status, 200, 'same-origin requests are unaffected');
   const noOrigin = await report(h, 'x', reportBody());
   assert.equal(noOrigin.status, 401, 'agent report has no Origin; auth still applies normally');
-  h.close();
 });
 
-test('trust-proxy takes client IP from X-Forwarded-For', async () => {
+test('trust-proxy takes client IP from X-Forwarded-For', async (t) => {
   const store = openStore(':memory:');
   store.setAdminPasswordHash(await hashPassword(PASSWORD));
   const engine = new AlertEngine(store, {
@@ -448,6 +485,10 @@ test('trust-proxy takes client IP from X-Forwarded-For', async () => {
     log: { info: () => {}, warn: () => {}, error: () => {} },
   });
   const server = app.listen(0, '127.0.0.1');
+  t.after(() => {
+    app.close();
+    store.close();
+  });
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${server.address().port}`;
   const attempt = (xff) => fetch(`${base}/api/login`, {
@@ -460,11 +501,10 @@ test('trust-proxy takes client IP from X-Forwarded-For', async () => {
   assert.equal(await attempt('10.0.0.1'), 401);
   assert.equal(await attempt('10.0.0.1'), 429, 'third failure from same XFF ip is limited');
   assert.equal(await attempt('10.0.0.2'), 401, 'different XFF ip has its own bucket');
-  await new Promise((r) => { server.close(r); server.closeAllConnections(); });
 });
 
-test('without trust-proxy the XFF header is ignored (spoof-safe default)', async () => {
-  const h = await startApp();
+test('without trust-proxy the XFF header is ignored (spoof-safe default)', async (t) => {
+  const h = await startApp(t);
   for (let i = 0; i < 5; i++) {
     const res = await fetch(`${h.base}/api/login`, {
       method: 'POST',
@@ -479,26 +519,34 @@ test('without trust-proxy the XFF header is ignored (spoof-safe default)', async
     body: JSON.stringify({ password: 'nope' }),
   });
   assert.equal(res.status, 429, 'all requests share the socket-IP bucket by default');
-  h.close();
 });
 
-test('session cookie gains Secure flag when HTTPS is detected', async () => {
-  const h = await startApp();
-  const res = await fetch(`${h.base}/api/login`, {
+test('session cookie gains Secure flag when HTTPS is detected via trustProxy, and ignores spoofed header otherwise', async (t) => {
+  const trusted = await startApp(t, { trustProxy: true });
+  const resTrusted = await fetch(`${trusted.base}/api/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' },
     body: JSON.stringify({ password: PASSWORD }),
   });
-  assert.equal(res.status, 200);
-  const setCookie = res.headers.get('set-cookie');
-  assert.match(setCookie, /Secure/i, 'login over detected HTTPS must set Secure');
-  h.close();
+  assert.equal(resTrusted.status, 200);
+  const setCookieTrusted = resTrusted.headers.get('set-cookie');
+  assert.match(setCookieTrusted, /Secure/i, 'login over trusted proxy HTTPS must set Secure');
+
+  const untrusted = await startApp(t, { trustProxy: false });
+  const resUntrusted = await fetch(`${untrusted.base}/api/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https' },
+    body: JSON.stringify({ password: PASSWORD }),
+  });
+  assert.equal(resUntrusted.status, 200);
+  const setCookieUntrusted = resUntrusted.headers.get('set-cookie');
+  assert.doesNotMatch(setCookieUntrusted, /;\s*Secure\b/i, 'x-forwarded-proto must be ignored when trustProxy is false');
 });
 
 // ---- settings/server input validation ----
 
-test('PUT settings rejects type-broken payloads instead of silently killing alerts', async () => {
-  const h = await startApp();
+test('PUT settings rejects type-broken payloads instead of silently killing alerts', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const bad = [
     { thresholds: 'banana' },
@@ -523,11 +571,10 @@ test('PUT settings rejects type-broken payloads instead of silently killing aler
   }
   // engine thresholds untouched by rejected payloads
   assert.equal(h.engine.thresholds.cpu, 90);
-  h.close();
 });
 
-test('PUT settings accepts boundary-valid values', async () => {
-  const h = await startApp();
+test('PUT settings accepts boundary-valid values', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const res = await h.call('/api/admin/settings', {
     method: 'PUT',
@@ -544,11 +591,86 @@ test('PUT settings accepts boundary-valid values', async () => {
   assert.equal(after.thresholds.cpu, 1);
   assert.equal(after.thresholds.expiryDays, 0);
   assert.equal(after.retentionDays, 1);
-  h.close();
 });
 
-test('server create/update validate field types', async () => {
-  const h = await startApp();
+test('GET /api/admin/settings masks telegram_bot_token and preserves it on masked echo', async (t) => {
+  const h = await startApp(t);
+  await login(h);
+  const realToken = '123456:abcdefghijklmnopqrstuvwxyz012345';
+  const put = await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ telegram_bot_token: realToken, telegram_chat_id: '987654' }),
+  });
+  assert.equal(put.status, 200);
+  const putJson = await put.json();
+  assert.equal(putJson.has_telegram_bot_token, true);
+  assert.notEqual(putJson.telegram_bot_token, realToken, 'PUT response must mask token');
+  assert.ok(!JSON.stringify(putJson).includes(realToken), 'raw token must never appear in PUT response');
+
+  const getRes = await h.call('/api/admin/settings');
+  assert.equal(getRes.status, 200);
+  const view = await getRes.json();
+  assert.equal(view.has_telegram_bot_token, true);
+  assert.equal(view.telegram_bot_token, '••••••••');
+  assert.equal(view.telegram_chat_id, '987654');
+  assert.ok(!JSON.stringify(view).includes(realToken), 'raw token must never appear in GET response');
+
+  // Echoing the masked placeholder back on unrelated updates preserves the real secret
+  const keepRes = await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ telegram_bot_token: view.telegram_bot_token, retentionDays: 14 }),
+  });
+  assert.equal(keepRes.status, 200);
+  assert.equal(h.store.getSetting('settings').telegram_bot_token, realToken);
+
+  // Explicit empty string clears the token
+  const clearRes = await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ telegram_bot_token: '' }),
+  });
+  assert.equal(clearRes.status, 200);
+  const cleared = await (await h.call('/api/admin/settings')).json();
+  assert.equal(cleared.has_telegram_bot_token, false);
+  assert.equal(cleared.telegram_bot_token, '');
+});
+
+test('settings and probe APIs block loopback, IMDS, and RFC1918 targets by default', async (t) => {
+  const h = await startApp(t);
+  await login(h);
+  for (const webhookUrl of [
+    'http://127.0.0.1:8080/hook',
+    'http://169.254.169.254/latest/meta-data/',
+    'http://10.0.0.1/hook',
+  ]) {
+    const res = await h.call('/api/admin/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ webhookUrl }),
+    });
+    assert.equal(res.status, 400, `webhookUrl ${webhookUrl} must be rejected`);
+  }
+  for (const probe of [
+    { name: 'h1', type: 'http', target: 'http://127.0.0.1:8080/' },
+    { name: 'h2', type: 'http', target: 'http://169.254.169.254/latest/meta-data/' },
+    { name: 'h3', type: 'http', target: 'http://10.0.0.1/' },
+    { name: 't1', type: 'tcp', target: '127.0.0.1:22' },
+    { name: 't2', type: 'tcp', target: '169.254.169.254:80' },
+    { name: 't3', type: 'tcp', target: '10.0.0.1:53' },
+  ]) {
+    const res = await h.call('/api/admin/probes', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(probe),
+    });
+    assert.equal(res.status, 400, `probe target ${probe.target} must be rejected`);
+  }
+});
+
+test('server create/update validate field types', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const badBodies = [
     { name: '' },
@@ -584,11 +706,10 @@ test('server create/update validate field types', async () => {
     });
     assert.equal(res.status, 400, `expected 400 for PATCH ${JSON.stringify(body)}`);
   }
-  h.close();
 });
 
-test('GET /api/admin/servers and /:id', async () => {
-  const h = await startApp();
+test('GET /api/admin/servers and /:id', async (t) => {
+  const h = await startApp(t);
   await login(h);
   const { id, token } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -601,11 +722,10 @@ test('GET /api/admin/servers and /:id', async () => {
   const one = await (await h.call(`/api/admin/servers/${id}`)).json();
   assert.equal(one.name, 'listed');
   assert.equal((await h.call('/api/admin/servers/9999')).status, 404);
-  h.close();
 });
 
-test('events limit clamps negatives and large values', async () => {
-  const h = await startApp();
+test('events limit clamps negatives and large values', async (t) => {
+  const h = await startApp(t);
   await login(h);
   for (const type of ['cpu', 'mem', 'disk']) {
     h.store.openEvent({ serverId: 1, type, level: 'critical', message: `e-${type}` }, 1000);
@@ -616,17 +736,16 @@ test('events limit clamps negatives and large values', async () => {
   assert.equal(neg.length, 3, 'negative limit must not become unlimited/0/error');
   const two = await (await h.call('/api/events?limit=2')).json();
   assert.equal(two.length, 2);
-  h.close();
 });
 
 // ---- probes, public status page, notify test ----
 
-function startAppWithRunner({ password = PASSWORD } = {}) {
-  return startApp({ password });
+function startAppWithRunner(t, opts = {}) {
+  return startApp(t, opts);
 }
 
-test('probe CRUD with validation and embedded latest results', async () => {
-  const h = await startAppWithRunner();
+test('probe CRUD with validation and embedded latest results', async (t) => {
+  const h = await startAppWithRunner(t);
   await login(h);
   const bad = [
     { name: '', type: 'http', target: 'https://a.b/' },
@@ -651,9 +770,6 @@ test('probe CRUD with validation and embedded latest results', async () => {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name: 'gateway', type: 'http', target: 'https://gw.example/health', intervalSec: 30 }),
   });
-  if (create.status !== 200) {
-    console.error('[dbg] create status', create.status, 'body:', await create.text());
-  }
   assert.equal(create.status, 200);
   const probe = await create.json();
 
@@ -677,11 +793,10 @@ test('probe CRUD with validation and embedded latest results', async () => {
 
   assert.equal((await h.call(`/api/admin/probes/${probe.id}`, { method: 'DELETE' })).status, 200);
   assert.deepEqual(await (await h.call('/api/admin/probes')).json(), []);
-  h.close();
 });
 
-test('probe history endpoint returns points', async () => {
-  const h = await startAppWithRunner();
+test('probe history endpoint returns points', async (t) => {
+  const h = await startAppWithRunner(t);
   await login(h);
   const probe = h.store.createProbe({ name: 'p', type: 'tcp', target: '127.0.0.1:22' });
   for (let i = 0; i < 5; i++) {
@@ -690,11 +805,10 @@ test('probe history endpoint returns points', async () => {
   const hist = await (await h.call(`/api/probes/${probe.id}/history?range=1h`)).json();
   assert.equal(hist.points.length, 5);
   assert.equal(hist.points[4].latencyMs, 14);
-  h.close();
 });
 
-test('public overview is gated and sanitized (v1.1 status page)', async () => {
-  const h = await startAppWithRunner();
+test('public overview is gated and sanitized (v1.1 status page)', async (t) => {
+  const h = await startAppWithRunner(t);
   await login(h);
   const { id } = await (await h.call('/api/admin/servers', {
     method: 'POST',
@@ -728,35 +842,60 @@ test('public overview is gated and sanitized (v1.1 status page)', async () => {
   // authed probe uptime data present
   assert.equal(typeof pub.servers[0].uptimePct24h, 'number');
   assert.equal(pub.probes[0].id, probe.id);
-  h.close();
 });
 
-test('notify-test reports per-channel delivery results', async () => {
-  const h = await startAppWithRunner();
+test('notify-test reports per-channel delivery results', async (t) => {
+  let telegramResult = false;
+  const h = await startAppWithRunner(t, {
+    allowPrivateTargets: true,
+    sendTelegramImpl: async () => telegramResult,
+  });
   await login(h);
-  await h.call('/api/admin/settings', {
+  const put1 = await h.call('/api/admin/settings', {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ webhookUrl: 'http://127.0.0.1:9/hook' /* refused */, telegram_bot_token: '123:x', telegram_chat_id: '42' }),
+    body: JSON.stringify({
+      webhookUrl: 'http://127.0.0.1:9/hook', /* refused */
+      telegram_bot_token: '123456:abcdefghijklmnopqrstuvwxyz012345',
+      telegram_chat_id: '42',
+    }),
   });
+  assert.equal(put1.status, 200);
   const res = await h.call('/api/admin/notify-test', { method: 'POST' });
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.deepEqual(body, { webhook: false, telegram: false }, 'both channels attempted; refused/unreachable = false');
 
+  // working local webhook + succeeding telegram → { webhook: true, telegram: true }
+  const hookServer = createServer((req, res2) => { res2.writeHead(200); res2.end('ok'); });
+  t.after(() => {
+    hookServer.closeAllConnections?.();
+    hookServer.close();
+  });
+  await new Promise((r) => hookServer.listen(0, '127.0.0.1', r));
+  telegramResult = true;
+  const putOk = await h.call('/api/admin/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ webhookUrl: `http://127.0.0.1:${hookServer.address().port}/hook` }),
+  });
+  assert.equal(putOk.status, 200);
+  const resOk = await h.call('/api/admin/notify-test', { method: 'POST' });
+  assert.deepEqual(await resOk.json(), { webhook: true, telegram: true });
+
   // empty config: channels report null (not configured)
-  await h.call('/api/admin/settings', {
+  const put2 = await h.call('/api/admin/settings', {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ webhookUrl: '', telegram_bot_token: '', telegram_chat_id: '' }),
   });
+  assert.equal(put2.status, 200);
   const res2 = await h.call('/api/admin/notify-test', { method: 'POST' });
   assert.deepEqual(await res2.json(), { webhook: null, telegram: null });
-  h.close();
 });
 
-test('public overview is cached and rate limited', async () => {
-  const h = await startAppWithRunner();
+test('public overview is cached and rate limited', async (t) => {
+  const h = await startAppWithRunner(t);
   await login(h);
   await h.call('/api/admin/servers', {
     method: 'POST',
@@ -784,11 +923,10 @@ test('public overview is cached and rate limited', async () => {
     body: JSON.stringify({ public_status: false }),
   });
   assert.equal((await fetch(`${h.base}/api/public/overview`)).status, 404, 'disabled beats the cache');
-  h.close();
 });
 
-test('server group and quota fields validate and persist', async () => {
-  const h = await startAppWithRunner();
+test('server group and quota fields validate and persist', async (t) => {
+  const h = await startAppWithRunner(t);
   await login(h);
   assert.equal((await h.call('/api/admin/servers', {
     method: 'POST',
@@ -812,5 +950,4 @@ test('server group and quota fields validate and persist', async () => {
   assert.equal(overview[0].groupName, '生产');
   assert.equal(overview[0].monthlyQuotaBytes, 1024 ** 3);
   assert.equal((await h.call(`/api/admin/servers/${id}`)).status, 200);
-  h.close();
 });

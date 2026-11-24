@@ -58,8 +58,9 @@ bash scripts/install-agent.sh --server http://x --token t --interval 0 >/dev/nul
 [ $? -ne 0 ] && ok "zero --interval rejected" || fail "interval validation" "accepted 0"
 
 # ---- 3e. deploy-readiness --------------------------------------------------
-[ -d "$TMP/root2/opt/vpswatch/data" ] && ok "data dir pre-created for sandboxed boot" || fail "data dir" "missing (EROFS crash loop)"
+[ -d "$TMP/root2/var/lib/vpswatch" ] && ok "data dir pre-created for sandboxed boot" || fail "data dir" "missing (EROFS crash loop)"
 grep -q 'VPSWATCH_DATA_DIR' "$TMP/root2/etc/vpswatch/hub.env" && ok "hub.env pins data dir" || fail "hub.env data dir" "missing"
+grep -vq 'VPSWATCH_ADMIN_PASSWORD' "$TMP/root2/etc/vpswatch/hub.env" && ok "hub.env omits plaintext admin password" || fail "hub.env plaintext password" "leaked"
 [ -f "$TMP/root2/opt/vpswatch/package.json" ] && ok "package.json copied (ESM module detection)" || fail "package.json" "missing"
 bash scripts/install-server.sh --print-unit | grep -q 'ReadWritePaths=.*-/var/lib/vpswatch' && ok "unit ReadWritePaths points at real state dir" || fail "ReadWritePaths" "$(bash scripts/install-server.sh --print-unit | grep ReadWritePaths)"
 # old node without node:sqlite must abort with a clear message

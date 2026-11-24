@@ -38,17 +38,41 @@ const CLI_KEYS = new Map([
   ['interval', 'intervalSec'],
 ]);
 
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 export function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
 export function deepMerge(base, patch) {
   const out = { ...base };
+  if (!isPlainObject(patch)) return out;
   for (const [k, v] of Object.entries(patch)) {
-    if (v === undefined) continue;
+    if (FORBIDDEN_KEYS.has(k) || v === undefined) continue;
     out[k] = isPlainObject(v) && isPlainObject(out[k]) ? deepMerge(out[k], v) : v;
   }
   return out;
+}
+
+export function resolveSettings(config = {}, saved = {}) {
+  const base = deepMerge(
+    {
+      webhookUrl: DEFAULTS.webhookUrl,
+      thresholds: { ...DEFAULTS.thresholds },
+      notifyCooldownMin: DEFAULTS.notifyCooldownMin,
+      retentionDays: DEFAULTS.retentionDays,
+      public_status: false,
+      telegram_bot_token: '',
+      telegram_chat_id: '',
+    },
+    {
+      webhookUrl: config.webhookUrl,
+      thresholds: config.thresholds,
+      notifyCooldownMin: config.notifyCooldownMin,
+      retentionDays: config.retentionDays,
+    },
+  );
+  return deepMerge(base, isPlainObject(saved) ? saved : {});
 }
 
 function parseArgs(argv) {
