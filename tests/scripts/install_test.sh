@@ -89,7 +89,7 @@ grep -q 'SERVER_URL="http://hub.example:3577"' "$TMP/root/etc/vpswatch/agent.con
 grep -q 'TOKEN="tok123"' "$TMP/root/etc/vpswatch/agent.conf" && ok "conf has token" || fail "conf token" "missing"
 grep -q 'INTERVAL="15"' "$TMP/root/etc/vpswatch/agent.conf" && ok "conf has interval" || fail "conf interval" "missing"
 
-perm=$(stat -f %Lp "$TMP/root/etc/vpswatch/agent.conf" 2>/dev/null || stat -c %a "$TMP/root/etc/vpswatch/agent.conf")
+perm=$(stat -c %a "$TMP/root/etc/vpswatch/agent.conf" 2>/dev/null || stat -f %Lp "$TMP/root/etc/vpswatch/agent.conf")
 assert_eq "conf permission is 600" "600" "$perm"
 
 [ -d "$TMP/root/var/lib/vpswatch" ] && ok "state dir created" || fail "state dir" "missing"
