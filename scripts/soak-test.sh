@@ -18,7 +18,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-node server/main.js --port "$PORT" --db-path "$TMP/d.db" --data-dir "$TMP" \
+VPSWATCH_ALLOW_PRIVATE_TARGETS=1 node server/main.js --port "$PORT" --db-path "$TMP/d.db" --data-dir "$TMP" \
   --admin-password soakpw > "$TMP/hub.log" 2>&1 &
 HUB_PID=$!
 for _ in $(seq 1 50); do curl -s -o /dev/null "$BASE/api/overview" && break; sleep 0.2; done
